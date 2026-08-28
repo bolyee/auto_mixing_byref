@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DDSP Vocal Auto Equalizer</title>
+    <!-- Google Fonts: Inter for general text, Orbitron for tech accents -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
+    <!-- Chart.js for beautiful charts -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/static/style.css?v=11">
+</head>
+<body>
+    <div class="glow-bg"></div>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <div class="logo">
+                <span class="icon">⚡</span>
+                <h1>DDSP VOCAL AUTO-EQ</h1>
+            </div>
+            <p class="subtitle">원하는 곡 보컬의 톤 밸런스를 내 보컬에 그대로 복제하는 스마트 이퀄라이저</p>
+        </header>
+
+        <!-- Main Content Grid -->
+        <main class="grid">
+            <!-- Left Side: Inputs & Settings -->
+            <section class="panel-left">
+                <!-- File Uploads -->
+                <div class="card upload-section">
+                    <h2 class="section-title"><span class="num">1</span> 오디오 파일 업로드</h2>
+                    
+                    <!-- Raw Vocal Upload -->
+                    <div class="upload-box" id="raw-upload-box">
+                        <input type="file" id="raw-file-input" accept="audio/*" hidden>
+                        <div class="upload-icon">🎙️</div>
+                        <div class="upload-text">
+                            <h3>내 보컬 (Raw Vocal)</h3>
+                            <p>이퀄라이징을 적용할 원본 보컬 파일</p>
+                            <span class="file-name" id="raw-file-name">파일을 드래그하거나 클릭하여 업로드</span>
+                        </div>
+                    </div>
+
+                    <!-- Reference Vocal Upload -->
+                    <div class="upload-box" id="ref-upload-box">
+                        <input type="file" id="ref-file-input" accept="audio/*" hidden>
+                        <div class="upload-icon">🎵</div>
+                        <div class="upload-text">
+                            <h3>대상 보컬 (Reference Vocal)</h3>
+                            <p>닮아가고 싶은 레퍼런스 곡 보컬 파일</p>
+                            <span class="file-name" id="ref-file-name">파일을 드래그하거나 클릭하여 업로드</span>
+                        </div>
+                    </div>
+
+                    <!-- Auto vocal extraction toggle -->
+                    <label id="separate-ref-row" style="display:flex; align-items:center; gap:10px; margin-top:12px; padding:10px 14px; background:rgba(155,81,224,0.08); border:1px solid rgba(155,81,224,0.3); border-radius:8px; cursor:pointer; font-size:0.9rem;">
+                        <input type="checkbox" id="separate-ref-check" style="width:18px; height:18px; accent-color:#9b51e0; cursor:pointer;">
+                        <span>🤖 레퍼런스에서 <strong>보컬 자동 추출</strong> — 아카펠라 없이 <strong>풀 곡</strong>을 넣어도 AI가 보컬만 분리해 사용 <span style="color:#a0a8c0; font-size:0.8rem;">(분리에 1~3분 소요)</span></span>
+                    </label>
+
+                    <!-- Instrumental Upload (optional) -->
+                    <div class="upload-box" id="inst-upload-box">
+                        <input type="file" id="inst-file-input" accept="audio/*" hidden>
+                        <div class="upload-icon">🎹</div>
+                        <div class="upload-text">
+                            <h3>반주 (Instrumental) <span style="font-size:0.75rem; color:#a0a8c0;">— 선택</span></h3>
+                            <p>업로드하면 처리된 보컬과 합쳐 최종 풀믹스를 생성</p>
+                            <span class="file-name" id="inst-file-name">파일을 드래그하거나 클릭하여 업로드</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Parameters Settings -->
+                <div class="card settings-section">
+                    <h2 class="section-title"><span class="num">2</span> 믹싱 파라미터 설정</h2>
+                    
+                    <div class="control-group">
+                        <div class="control-label">
+                            <label>믹싱 처리 모듈 활성화 (Processing Modules)</label>
+                        </div>
+                        <div class="toggle-grid">
+                            <button type="button" class="toggle-btn active" id="toggle-eq" data-value="eq">
+                                <span class="indicator"></span> 이퀄라이저 (EQ)
+                            </button>
+                            <button type="button" class="toggle-btn active" id="toggle-comp" data-value="comp">
+                                <span class="indicator"></span> 컴프레서 (Comp)
+                            </button>
+                            <button type="button" class="toggle-btn active" id="toggle-reverb" data-value="reverb">
+                                <span class="indicator"></span> 리버브 (Reverb)
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 리버브 방식 / 측정 대상 선택 (A/B 비교용) -->
+                    <div class="control-group" id="reverb-opts">
+                        <div class="control-label"><label>리버브 방식 (Reverb Method)</label></div>
+                        <div class="toggle-grid" style="margin-bottom:10px;">
+                            <button type="button" class="toggle-btn" id="rmode-measured" data-value="measured">
+                                <span class="indicator"></span> 자동 · 측정 IR
+                            </button>
+                            <button type="button" class="toggle-btn" id="rmode-synth" data-value="synth">
+                                <span class="indicator"></span> 자동 · 합성
+                            </button>
+                            <button type="button" class="toggle-btn active" id="rmode-manual" data-value="manual">
+                                <span class="indicator"></span> 수동 지정
+                            </button>
+                        </div>
+
+                        <!-- 자동 모드 전용: 잔향을 어디서 측정할지 -->
+                        <!-- 기본 방식이 '수동 지정'이라 처음엔 숨긴 상태로 시작한다.
+                             (syncReverbModeUI 가 로드 직후 다시 맞추지만, 인라인
+                              스타일을 안 주면 첫 페인트에서 잠깐 보였다 사라진다.) -->
+                        <div id="auto-reverb-opts" style="display:none;">
+                            <div class="control-label"><label>잔향 측정 대상 (IR Source)</label></div>
+                            <div class="toggle-grid">
+                                <button type="button" class="toggle-btn active" id="rsrc-instrumental" data-value="instrumental">
+                                    <span class="indicator"></span> 반주
+                                </button>
+                                <button type="button" class="toggle-btn" id="rsrc-reference" data-value="reference">
+                                    <span class="indicator"></span> 레퍼런스 보컬
+                                </button>
+                            </div>
+                            <span class="help-text">측정 IR = 실제 잔향 파형을 그대로 복사 · 합성 = 레퍼런스에서 RT60을 추출하고 wet을 학습. 반주는 분리 아티팩트가 없어 대체로 더 정확합니다.</span>
+
+                            <label style="display:flex; align-items:center; gap:10px; margin-top:12px; padding:10px 14px; background:rgba(0,242,254,0.08); border:1px solid rgba(0,242,254,0.3); border-radius:8px; cursor:pointer; font-size:0.9rem;">
+                                <input type="checkbox" id="compare-reverbs-check" style="width:18px; height:18px; accent-color:#00f2fe; cursor:pointer;">
+                                <span>🔬 <strong>리버브 4조합 모두 렌더</strong> — 측정/합성 × 반주/레퍼런스를 전부 만들어 비교 재생 <span style="color:#a0a8c0; font-size:0.8rem;">(시간 4배)</span></span>
+                            </label>
+                        </div>
+
+                        <!-- 수동 모드 전용: RT60 / wet 직접 지정 (기본 방식) -->
+                        <div id="manual-reverb-opts">
+                            <div class="control-label">
+                                <label for="manual-rt60">잔향 시간 RT60 (Reverb Time)</label>
+                                <span class="value-display" id="manual-rt60-val">1.00 s</span>
+                            </div>
+                            <input type="range" id="manual-rt60" min="0.1" max="4.0" step="0.05" value="1.0" class="slider">
+                            <span class="help-text">-60 dB까지 감쇠하는 데 걸리는 시간. 작은 방 0.3~0.6초, 홀 1.5~3초.</span>
+
+                            <div class="control-label" style="margin-top:12px;">
+                                <label for="manual-wet">잔향 비율 (Wet / Dry)</label>
+                                <span class="value-display" id="manual-wet-val">30%</span>
+                            </div>
+                            <input type="range" id="manual-wet" min="0" max="1" step="0.01" value="0.3" class="slider">
+                            <span class="help-text">출력 = (1−wet)·원음 + wet·잔향. 100%면 원음이 전부 잔향으로 대체됩니다.</span>
+
+                            <span class="help-text" style="display:block; margin-top:10px; color:#00f2fe;">수동 모드는 레퍼런스에서 아무것도 추정하지 않습니다 — IR 추정(최초 약 60초)과 학습을 모두 건너뛰므로 훨씬 빠릅니다.</span>
+                        </div>
+                    </div>
+
+                    <!-- 리버브 4조합 비교 재생 -->
+                    <div class="card" id="reverb-compare-card" style="display:none; margin-top:16px;">
+                        <h2 class="section-title"><span class="num">🔬</span> 리버브 조합 비교</h2>
+                        <div id="reverb-compare-list"></div>
+                        <span class="help-text">EQ·컴프는 조합마다 각각 학습된 결과입니다. 들어보고 가장 자연스러운 조합을 고르세요.</span>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <label for="match-amount">보컬 매칭 강도 (Matching Strength)</label>
+                            <span class="value-display" id="match-amount-val">80%</span>
+                        </div>
+                        <input type="range" id="match-amount" min="0" max="1" step="0.05" value="0.8" class="slider">
+                        <span class="help-text">레퍼런스의 음색(EQ)과 다이내믹(컴프레서)을 얼마나 복사하여 매칭할지 조절합니다.</span>
+                    </div>
+
+                    <!-- 잔향량(센드)은 자동 모드 전용. 수동 모드에서는 wet 슬라이더와
+                         역할이 겹치므로 숨긴다(서버도 수동일 때 1.0 으로 고정). 기본이
+                         수동이라 처음엔 숨긴 상태로 시작한다. -->
+                    <div class="control-group" id="reverb-amount-group" style="display:none;">
+                        <div class="control-label">
+                            <label for="reverb-amount">잔향량 (Reverb Amount)</label>
+                            <span class="value-display" id="reverb-amount-val">30%</span>
+                        </div>
+                        <input type="range" id="reverb-amount" min="0" max="1" step="0.05" value="0.3" class="slider">
+                        <span class="help-text">추정된 IR의 잔향을 얼마나 보낼지 조절합니다(센드량). 드라이 보컬은 IR을 통과하지 않으므로 고역이 보존됩니다. 0%면 잔향 없음.</span>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <label for="eq-bands">이큐 밴드 개수 (EQ Bands Count)</label>
+                            <span class="value-display" id="eq-bands-val">17</span>
+                        </div>
+                        <input type="range" id="eq-bands" min="3" max="31" step="1" value="17" class="slider">
+                        <span class="help-text">최적화에 사용할 파라메트릭 이큐 필터 밴드의 개수입니다. 밴드는 <strong>200 Hz ~ 10 kHz</strong> 로그 등간격으로 놓입니다 — 200 Hz 아래는 보컬 분리 과정에서 저역이 소실되고, 10 kHz 위는 mp3 등 손실 압축으로 정보가 없어 둘 다 매칭 대상에서 제외했습니다. (3 ~ 31개)</span>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <label for="eq-l2">이큐 게인 페널티 (EQ L2)</label>
+                            <span class="value-display" id="eq-l2-val">0.0100</span>
+                        </div>
+                        <input type="range" id="eq-l2" min="0" max="0.5" step="0.0005" value="0.01" class="slider">
+                        <span class="help-text">밴드 게인 크기 제곱 페널티. 크게 하면 부스트/컷 폭이 전체적으로 작아집니다. 0.0005 단위로 조절되며 0이면 제한 없음.</span>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <label for="eq-smooth">이큐 커브 평활 페널티 (EQ Smooth)</label>
+                            <span class="value-display" id="eq-smooth-val">0.1000</span>
+                        </div>
+                        <input type="range" id="eq-smooth" min="0" max="2" step="0.0005" value="0.1" class="slider">
+                        <span class="help-text">인접 밴드 게인 차이의 제곱 페널티. 크게 하면 이큐 커브가 매끈해지고 톱니 모양이 사라집니다.</span>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <label for="comp-ratio">컴프 압축비 (Ratio)</label>
+                            <span class="value-display" id="comp-ratio-val">3.0 : 1</span>
+                        </div>
+                        <input type="range" id="comp-ratio" min="1" max="30" step="0.5" value="3" class="slider">
+                        <span class="help-text">얼마나 세게 누를지. 1 = 무압축, 3 = 보컬 표준, 10 이상 = 리미터에 가까움. 학습 대상이 아니라 직접 고르는 값이며, threshold 는 이 값에 맞춰 학습됩니다.</span>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <label for="comp-thresh">컴프 threshold 심도 페널티 (Comp Threshold)</label>
+                            <span class="value-display" id="comp-thresh-val">0.0000</span>
+                        </div>
+                        <input type="range" id="comp-thresh" min="0" max="2" step="0.0005" value="0" class="slider">
+                        <span class="help-text">threshold 가 신호 아래(-60dB 쪽)로 깊게 내려가는 것을 막습니다. ratio 가 3:1 로 고정돼 있어 threshold 혼자 압축량을 결정하므로, 바닥까지 내려가면 컴프가 아니라 포락선 스케일러가 됩니다. 0이면 비활성.</span>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <label for="vocal-gain">보컬 볼륨 (Vocal Level in Mix)</label>
+                            <span class="value-display" id="vocal-gain-val">0.0 dB</span>
+                        </div>
+                        <input type="range" id="vocal-gain" min="-12" max="12" step="0.5" value="0" class="slider">
+                        <span class="help-text">반주와 합칠 때 보컬의 상대 볼륨(dB). 반주 업로드 시에만 적용됩니다.</span>
+                    </div>
+
+                    <div class="control-group">
+                        <label id="master-row" style="display:flex; align-items:center; gap:10px; padding:10px 14px; background:rgba(0,242,254,0.08); border:1px solid rgba(0,242,254,0.3); border-radius:8px; cursor:pointer; font-size:0.9rem;">
+                            <input type="checkbox" id="master-check" style="width:18px; height:18px; accent-color:#00f2fe; cursor:pointer;">
+                            <span>🎚️ <strong>마스터링</strong> — 풀믹스 톤을 레퍼런스 곡에 맞추고 라우드니스 매칭 + 브릭월 리미터 <span style="color:#a0a8c0; font-size:0.8rem;">(반주 업로드 시에만)</span></span>
+                        </label>
+                    </div>
+
+                    <button id="process-btn" class="btn-primary" disabled>
+                        <span class="btn-text">믹스 시작하기</span>
+                        <div class="loader" id="btn-loader" hidden></div>
+                    </button>
+                </div>
+            </section>
+
+            <!-- Right Side: Visualization & Audio Players -->
+            <section class="panel-right">
+                <!-- Visualization Chart -->
+                <div class="card chart-card" id="chart-card" style="display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 class="section-title" style="margin-bottom: 0;"><span class="num">🎚️</span> 음색 톤 매칭 결과 (Spectral EQ) <span style="font-size:0.75rem; color:#a0a8c0; font-weight:400;">— 매칭 대역 200 Hz ~ 10 kHz</span></h2>
+                        <div style="background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); padding: 5px 12px; border-radius: 6px; font-size: 0.85rem; color: #00f2fe;">
+                            음색 평균 오차 (Tonal MAE): <strong id="tonal-error-val-card">0.00 dB</strong>
+                        </div>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="eqChart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Noise Gate Result (chain 최전단, raw 보컬 전처리) -->
+                <div class="card" id="gate-card" style="display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 class="section-title" style="margin-bottom: 0;"><span class="num">🚪</span> 노이즈 게이트 (Raw 전처리)</h2>
+                        <div id="gate-status-badge" style="padding: 5px 12px; border-radius: 6px; font-size: 0.85rem;">—</div>
+                    </div>
+                    <div class="meter-grid">
+                        <div class="meter-container">
+                            <span class="meter-label">노이즈 플로어 (Noise Floor)</span>
+                            <span class="meter-value" id="gate-floor-val">— dB</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">게이트 스레숄드 (Threshold)</span>
+                            <span class="meter-value" id="gate-thresh-val">— dB</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">분리도 (SNR)</span>
+                            <span class="meter-value" id="gate-snr-val">— dB</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">감쇠량 (Reduction)</span>
+                            <span class="meter-value" id="gate-reduction-val">— dB</span>
+                        </div>
+                    </div>
+                    <div style="margin-top: 12px; font-size: 0.85rem; color: #a0a8c0;" id="gate-note"></div>
+                </div>
+
+                <!-- Dynamic Range & Serial Comp Meters -->
+                <div class="card comp-meter-card" id="comp-meter-card" style="display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 class="section-title" style="margin-bottom: 0;"><span class="num">⚡</span> 다이내믹 매칭 결과 <span id="comp-engine-label" style="font-size:0.8rem; color:#00f2fe;"></span></h2>
+                        <div style="background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); padding: 5px 12px; border-radius: 6px; font-size: 0.85rem; color: #00f2fe;">
+                            다이내믹 오차: <strong id="dynamics-error-val-card">0.00</strong> <span style="color:#aaa;">dB</span>
+                        </div>
+                    </div>
+
+                    <!-- Dynamic Range Grid -->
+                    <div style="margin-bottom: 12px; font-weight: bold; color: #4facfe; font-size: 0.9rem;">
+                        <span id="dyn-metric-title">다이내믹 레인지 (Crest Factor = True Peak − RMS)</span>
+                        <span style="color:#888; font-weight:normal; font-size:0.8rem;" id="dyn-metric-note"> · ITU-R BS.1770-4</span>
+                    </div>
+                    <div class="meter-grid">
+                        <div class="meter-container">
+                            <span class="meter-label">보컬 원본 (Raw)</span>
+                            <span class="meter-value" id="syl-std-raw-val">0.00 dB</span>
+                            <span style="font-size:0.72rem; color:#888;" id="lufs-raw-val"></span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">레퍼런스 = 목표</span>
+                            <span class="meter-value" id="syl-std-ref-val" style="color:#00f2fe;">0.00 dB</span>
+                            <span style="font-size:0.72rem; color:#888;" id="lufs-ref-val"></span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">믹싱 완료 (Processed)</span>
+                            <span class="meter-value" id="syl-std-proc-val">0.00 dB</span>
+                            <span style="font-size:0.72rem; color:#888;" id="lufs-proc-val"></span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">목표까지 남은 오차</span>
+                            <span class="meter-value" id="syl-std-diff-val" style="color: #4facfe;">0.00 dB</span>
+                        </div>
+                    </div>
+
+                    <!-- Compressor Status Grid -->
+                    <div style="margin-top: 15px; margin-bottom: 12px; font-weight: bold; color: #00f2fe; font-size: 0.9rem;">
+                        컴프레서 동작 (Compressor Status)
+                    </div>
+                    <div class="meter-grid">
+                        <div class="meter-container">
+                            <span class="meter-label">최대 게인 리덕션 (Max GR)</span>
+                            <span class="meter-value" id="max-gr-val">0.0 dB</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">스레숄드 (Threshold)</span>
+                            <span class="meter-value" id="comp-thr-val">— dB</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">방식 / 레이시오</span>
+                            <span class="meter-value" id="comp-method-val">—</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">어택 / 릴리즈</span>
+                            <span class="meter-value" id="comp-ballistics-val">—</span>
+                        </div>
+                    </div>
+
+                    <!-- Footer -->
+                    <div class="comp-status-container" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); display: flex; justify-content: space-between; font-size: 0.85rem; color: #ccc;">
+                        <div>원본 <strong id="comp-src-dr" style="color: #fff;">0.0 dB</strong></div>
+                        <div>레퍼런스 <strong id="comp-ref-dr" style="color: #00f2fe;">0.0 dB</strong></div>
+                        <div>처리 후 <strong id="comp-shaped-dr" style="color: #4facfe;">0.0 dB</strong></div>
+                        <div id="comp-learn-note" style="color:#888;"></div>
+                    </div>
+                </div>
+
+                <!-- Reverb Matching Parameters Card -->
+                <div class="card reverb-card" id="reverb-card" style="display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 class="section-title" style="margin-bottom: 0;"><span class="num">🌌</span> 공간감 매칭 결과 <span id="reverb-engine-label" style="font-size:0.8rem; color:#00f2fe;"></span></h2>
+                        <div style="background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); padding: 5px 12px; border-radius: 6px; font-size: 0.85rem; color: #00f2fe;">
+                            <span id="reverb-error-label">잔향 감쇠 오차 (EDC)</span>: <strong id="reverb-error-val-card">0.00</strong>
+                        </div>
+                    </div>
+
+                    <div class="meter-grid" style="grid-template-columns: repeat(4, 1fr);">
+                        <div class="meter-container">
+                            <span class="meter-label">잔향 시간 (RT60)
+                                <span id="rt60-badge" style="font-size:0.68rem; background:rgba(0,242,254,.15); border:1px solid rgba(0,242,254,.35); border-radius:4px; padding:1px 5px; margin-left:4px;"></span>
+                            </span>
+                            <div style="font-size: 0.85rem; margin-top: 4px; line-height: 1.4;">
+                                <strong id="reverb-rt60-val" style="color: #fff; font-size:1.15rem;">0.00s</strong><br>
+                                <span style="color:#4facfe; font-size:0.75rem;" id="reverb-edt-val">—</span><br>
+                                <span style="color:#888; font-size:0.75rem;" id="reverb-rt60-src">—</span>
+                            </div>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label"><span id="reverb-wet-label">잔향 혼합 비율 (Wet)</span>
+                                <span id="wet-badge" style="font-size:0.68rem; background:rgba(79,172,254,.15); border:1px solid rgba(79,172,254,.35); border-radius:4px; padding:1px 5px; margin-left:4px;"></span>
+                            </span>
+                            <div style="font-size: 0.85rem; margin-top: 4px; line-height: 1.4;">
+                                <strong id="reverb-wet-val" style="color: #fff; font-size:1.15rem;">0.0%</strong><br>
+                                <span style="color:#4facfe; font-size:0.75rem;" id="reverb-c80-val">—</span><br>
+                                <span style="color:#888; font-size:0.75rem;" id="reverb-wet-note">—</span>
+                            </div>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">대역별 감쇠
+                                <span id="band-badge" style="font-size:0.68rem; background:rgba(0,242,254,.15); border:1px solid rgba(0,242,254,.35); border-radius:4px; padding:1px 5px; margin-left:4px;"></span>
+                            </span>
+                            <div style="font-size: 0.85rem; margin-top: 4px; line-height: 1.4;">
+                                <strong id="reverb-band-val" style="color: #fff; font-size:1.15rem;">—</strong><br>
+                                <span style="color:#888; font-size:0.75rem;" id="reverb-band-note">—</span>
+                            </div>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label" id="reverb-basis-label">추출 근거</span>
+                            <div style="font-size: 0.85rem; margin-top: 4px; line-height: 1.4;">
+                                <strong id="reverb-sim-val" style="color: #00f2fe; font-size: 1.15rem;">—</strong><br>
+                                <span style="color:#4facfe; font-size:0.75rem;" id="reverb-ir-len">—</span><br>
+                                <span style="color: #aaa; font-size: 0.75rem;" id="reverb-method-note">—</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Mastering Result Card -->
+                <div class="card" id="master-card" style="display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 class="section-title" style="margin-bottom: 0;"><span class="num">🎚️</span> 마스터링 결과 (Mastering)</h2>
+                        <div style="background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); padding: 5px 12px; border-radius: 6px; font-size: 0.85rem; color: #00f2fe;">
+                            최종 LUFS: <strong id="master-final-lufs">0.0</strong>
+                        </div>
+                    </div>
+
+                    <!-- Mastering EQ curve -->
+                    <div style="margin-bottom: 8px; font-weight: bold; color: #39ff14; font-size: 0.9rem;">
+                        마스터 EQ 커브 (레퍼런스 곡 톤 매칭)
+                    </div>
+                    <div class="chart-container" style="height: 180px;">
+                        <canvas id="masterEqChart"></canvas>
+                    </div>
+
+                    <!-- Loudness & Limiter grid -->
+                    <div style="margin-top: 15px; margin-bottom: 12px; font-weight: bold; color: #00f2fe; font-size: 0.9rem;">
+                        라우드니스 & 리미터
+                    </div>
+                    <div class="meter-grid">
+                        <div class="meter-container">
+                            <span class="meter-label">레퍼런스 LUFS (목표)</span>
+                            <span class="meter-value" id="master-ref-lufs">0.0</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">메이크업 게인</span>
+                            <span class="meter-value" id="master-makeup">0.0 dB</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">최종 LUFS</span>
+                            <span class="meter-value" id="master-final-lufs2">0.0</span>
+                        </div>
+                        <div class="meter-container">
+                            <span class="meter-label">최종 피크 / 실링</span>
+                            <span class="meter-value" id="master-peak">0.0 dB</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Interactive Player Dashboard -->
+                <div class="card player-card">
+                    <div class="title-row-with-badge">
+                        <h2 class="section-title"><span class="num">4</span> 모니터링 & 비교 (A/B Test)</h2>
+                    </div>
+                    
+                    <div class="player-controls-container">
+                        <!-- Playback Progress Slider (Global) -->
+                        <div class="global-progress-bar">
+                            <span class="time-display" id="current-time">00:00</span>
+                            <input type="range" id="global-seek" min="0" max="100" value="0" class="slider seek-slider" disabled>
+                            <span class="time-display" id="duration">00:00</span>
+                        </div>
+
+                        <!-- A/B Comparison Switcher -->
+                        <div class="ab-switcher-row">
+                            <div class="player-mode-selector">
+                                <button class="mode-btn active" id="mode-raw" disabled>RAW (원본)</button>
+                                <button class="mode-btn" id="mode-processed" disabled>PROCESSED (EQ적용)</button>
+                                <button class="mode-btn" id="mode-ref" disabled>REFERENCE (대상)</button>
+                                <button class="mode-btn" id="mode-fullmix-raw" disabled style="display: none;">풀믹스 (처리전+반주)</button>
+                                <button class="mode-btn" id="mode-fullmix" disabled style="display: none;">풀믹스 (처리후+반주)</button>
+                                <button class="mode-btn" id="mode-mastered" disabled style="display: none;">🎚️ 마스터</button>
+                            </div>
+                            
+                            <div class="main-audio-controls">
+                                <button class="play-btn" id="master-play-btn" disabled>
+                                    <span class="play-icon">▶</span>
+                                </button>
+                                <div class="volume-control">
+                                    <span class="volume-icon">🔊</span>
+                                    <input type="range" id="master-volume" min="0" max="1" step="0.05" value="0.8" class="slider volume-slider">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="action-row">
+                            <a id="download-btn" class="btn-secondary" href="#" download="processed_vocal.wav" style="display: none;">
+                                📥 결과 파일 다운로드 (WAV)
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    
+    <!-- Hidden HTML5 Audio tags for playback management -->
+    <audio id="audio-raw" preload="auto"></audio>
+    <audio id="audio-processed" preload="auto"></audio>
+    <audio id="audio-ref" preload="auto"></audio>
+    <audio id="audio-fullmix" preload="auto"></audio>
+    <audio id="audio-fullmix-raw" preload="auto"></audio>
+    <audio id="audio-mastered" preload="auto"></audio>
+
+    <script src="/static/app.js?v=12"></script>
+</body>
+</html>

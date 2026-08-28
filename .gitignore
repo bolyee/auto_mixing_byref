@@ -1,0 +1,46 @@
+# --- Python ---
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# --- OS ---
+.DS_Store
+._*
+Thumbs.db
+
+# --- Audio assets (large / copyrighted) ---
+사용할음악들/
+*.wav
+*.mp3
+*.flac
+*.aiff
+*.m4a
+*.ogg
+
+# --- Runtime data ---
+data/uploads/
+data/outputs/
+.ir_cache/
+*.npz
+
+# --- Model weights / checkpoints ---
+*.tar
+*.pt
+*.pth
+*.ckpt
+
+# --- Third-party repo (clone separately) ---
+# git clone https://github.com/Audio-WestlakeU/Rec-RIR.git
+Rec-RIR/
+
+# --- Docs / papers ---
+ddsp_paper.pdf
+
+# --- Local tooling ---
+.claude/
+*.log
