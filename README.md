@@ -396,7 +396,7 @@ threshold 와 강하게 뒤엉켜 손실 지형만 나빠지고, 실제 믹싱�
 * **`losses.py`** — `DSPMatchingLoss`: `tone_loss` / `dyn_loss` / `decay_loss` 를 **따로** 돌려주고(합치지 않음), 레퍼런스 통계를 캐시합니다. 미분 가능 `LoudnessMeter`(BS.1770-4) 포함.
 * **`recrir_ir.py`** — Rec-RIR 래퍼. 모델 로딩, 분석 구간 선택(`select_window`), 직접음 피크 정규화, 음향 지표(RT60/EDT/DRR/C80/대역별), `.ir_cache` 관리.
 * **`separation.py`** — torchaudio Hybrid Demucs 로 보컬(+반주) 스템 추출.
-* **`Rec-RIR/`** — 논문 원 구현(체크포인트 `ckpt/epoch35.tar`, 설정 `config/Rec-RIR.toml`).
+* **`Rec-RIR/`** — 논문 원 구현(체크포인트 `ckpt/epoch35.tar`, 설정 `config/Rec-RIR.toml`). **이 저장소에는 포함되지 않습니다** — [설치 0-(a)](#0-설치-최초-1회) 참조.
 * **`legacy/`** — 구 순차 엔진(`ddsp.py`), 구 IR 추출기(`ir_extract.py`), 구 프론트엔드 등 참고용 보관.
 * **`test_integration.py`** — 합성 신호로 API 스키마·수렴·스테레오 출력·**드라이 신호에 잔향을 환각하지 않는지**를 단정문 검사하는 통합 테스트.
 * **`static/`** — 웹 UI(HTML / CSS / JS).
@@ -407,6 +407,30 @@ threshold 와 강하게 뒤엉켜 손실 지형만 나빠지고, 실제 믹싱�
 ---
 
 ## 🚀 빠른 시작 (Quick Start)
+
+### 0. 설치 (최초 1회)
+
+이 저장소에는 코드만 포함되어 있습니다. 아래 항목들은 용량·저작권 문제로 `.gitignore` 처리되어 있으므로 직접 준비해야 합니다.
+
+**(a) Rec-RIR 원 구현 클론** — `recrir_ir.py` 가 참조합니다.
+```bash
+git clone https://github.com/Audio-WestlakeU/Rec-RIR.git
+```
+체크포인트 `Rec-RIR/ckpt/epoch35.tar` 와 설정 `Rec-RIR/config/Rec-RIR.toml` 이 있어야 IR 추정이 동작합니다. 없으면 합성 리버브 폴백(`reverb_mode="synth"`)으로만 실행됩니다.
+
+**(b) 가상환경 생성**
+```bash
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+```
+
+**(c) 오디오 소재** — 테스트용 보컬/반주 음원은 포함되어 있지 않습니다. 웹 UI 에서 직접 업로드하세요. 런타임 산출물 디렉터리는 자동 생성됩니다.
+
+```
+data/uploads/    업로드 원본 (gitignored)
+data/outputs/    렌더링 결과 (gitignored)
+.ir_cache/       IR 추정 캐시 (gitignored)
+```
 
 ### 1. 서버 실행
 ```bash
