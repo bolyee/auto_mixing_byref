@@ -47,7 +47,7 @@ async def api_match_eq(
     # EQ 정규화(페널티) 계수 — 밴드 게인의 크기/거칠기를 억제한다.
     #   eq_l2:     mean(g^2) 페널티. 크면 전체 부스트/컷 폭이 작아진다.
     #   eq_smooth: mean(diff(g)^2) 페널티. 크면 인접 밴드 간 요철이 줄어 커브가 매끈해진다.
-    eq_l2: float = Form(0.01),
+    eq_l2: float = Form(0.1),
     eq_smooth: float = Form(0.1),
     # 컴프 ratio. 학습하지 않는 설정값(1=무압축, 3=보컬 표준, 큰 값=리미터).
     comp_ratio: float = Form(3.0),
