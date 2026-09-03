@@ -29,15 +29,12 @@ style: |
   table { font-size: 0.75em; }
 ---
 
-# EQ · Compressor 수학 명세서
+# 발표
 
-DDSP Vocal Auto-Mix — 톤/다이내믹 매칭 경로 전체 정의
+DDSP Vocal Auto-Mix 
 
-이현중 · 2026.08.19
-코드 기준: `pipeline.py` · `modules.py` · `losses.py`
+이현중 · 2026.09.02
 
-> **이 문서의 목적**: 리버브를 제외한 EQ·컴프 경로의 **모든 연산을 빠짐없이 수식으로 고정**한다.
-> 마지막 장들(§18–§23)은 코드와 수식을 대조하다 발견한 **불일치·의심 지점 목록**이다. 각 항목마다 *현상 → 수식 → 확인 방법 → 수정 후보* 를 적었다.
 
 ---
 
@@ -45,7 +42,9 @@ DDSP Vocal Auto-Mix — 톤/다이내믹 매칭 경로 전체 정의
 
 **범위**: 입력 로드 → EQ → 컴프 → 손실 → 지표. 리버브 **모듈 내부**(`MeasuredIRReverb` 의 IR 추정, `L_decay`)는 이 문서 밖이다. 측정 IR 리버브는 학습 파라미터가 없으므로 그 경우 `L_decay` 는 **계산 자체를 하지 않는다**(합산 구조가 아니므로 가중치로 끄는 개념도 없다).
 
-> **단, 리버브는 손실 경로 안에 있다** (`LOSS_MEASURE_POINT = "post_reverb"`, §11-E). $L_{\text{tone}}$·$L_{\text{dyn}}$ 은 리버브까지 통과한 신호에서 재고, EQ·컴프의 그래디언트가 리버브 컨볼루션을 **관통해서** 흐른다. 리버브 자체에 학습할 스칼라가 없다는 것과, 리버브가 손실이 보는 신호를 바꾼다는 것은 별개다.
+> **단, 리버브는 손실 경로 안에 있다** (`LOSS_MEASURE_POINT = "post_reverb"`). $L_{\text{tone}}$·$L_{\text{dyn}}$ 은 리버브까지 통과한 신호에서 재고, EQ·컴프의 그래디언트가 리버브 컨볼루션을 **관통해서** 흐른다. 리버브 자체에 학습할 스칼라가 없다는 것과, 리버브가 손실이 보는 신호를 바꾼다는 것은 별개다.
+
+---
 
 | 기호 | 의미 |
 |---|---|
@@ -67,21 +66,25 @@ DDSP Vocal Auto-Mix — 톤/다이내믹 매칭 경로 전체 정의
 |---|---|---|---|
 | STFT | $N_{\text{fft}},H$ | 2048, 512 (Hann, center) | `pipeline.py` |
 | EQ | $J$ | **17** (함수·API·UI 공통 기본) | `pipeline.VOCAL_EQ_BANDS` |
-| EQ | $G_{\max}$ | 15 dB | `main.match_e2e(max_gain_db=)` |
+| EQ | $G_{\max}$ | 15 dB | `pipeline.match_e2e(max_gain_db=)` |
 | EQ | 밴드 범위 | **200 Hz – 10 kHz** (로그 등간격) | `VOCAL_EQ_MIN/MAX_FREQ` |
 | EQ | $\sigma$ | $0.6\times$ 밴드 간격 (log2) = 0.2116 oct | `modules.py` |
 | EQ 마스크 | $M_{\text{eq}}$ | $[200, 10000)$ Hz 밖은 0 dB 바이패스 | `pipeline.py` |
-| 고정 필터 | — | **없음** (HPF·LPF 모두 삭제) | — |
 | 컴프 | $K$ | 4 dB (soft knee) | `DifferentiableCompressor(knee_db=)` |
 | 컴프 | $H_d, W_d$ | 128, 256 samples | `DifferentiableCompressor(detector_hop=)` |
 | 컴프 | $\tau_a,\tau_r$ | 0.5 ms, 120 ms | `pipeline.match_e2e(attack_ms=, release_ms=)` |
 | 컴프 | $R$ | **설정 가능 상수 (기본 3.0 : 1), 학습 안 함** | `pipeline.COMP_RATIO` |
 | 컴프 초기값 | $T_0$ | $-30$ dB | `modules.py` |
-| 정규화 | $\lambda_2,\lambda_s$ | 0.01, 0.1 | `main.py` |
+
+---
+
+| 구분 | 기호 | 값 | 위치 |
+|---|---|---|---|
+| 정규화 | $\lambda_2,\lambda_s$ | 0.1, 0.1 | `main.py` |
 | 정규화 | $w_t$ | 0.0 (threshold 심도) | `main.py` |
 | 학습 | lr | EQ 0.05 / Comp 0.02, $n=50$ | `pipeline.match_e2e(lr_eq=, lr_comp=, n_steps=)` |
 | 학습 | 그래디언트 경로 | `"selective"` | `pipeline.LOSS_GRAD_MODE` (§11) |
-| 학습 | 손실 측정 지점 | `"post_reverb"` (리버브 뒤) | `pipeline.LOSS_MEASURE_POINT` (§11-E) |
+| 학습 | 손실 측정 지점 | `"post_reverb"` (리버브 뒤) | `pipeline.LOSS_MEASURE_POINT` |
 
 ---
 
@@ -102,7 +105,6 @@ $$S(f,t)=\sum_{n} x[n+tH]\,w[n]\,e^{-i2\pi fn/N_{\text{fft}}},\qquad y=\text{iST
 * $L_{\text{tone}}$ (EQ): **곡 전체** ($x_{\text{train}}=x$). 짧은 구간을 쓰면 EQ 가 그 구간에 과적합되어 곡 전체 톤이 악화된다(실측 2.419 vs 무처리 2.369).
 * $L_{\text{dyn}}$ (컴프): **하이라이트 15초 구간**. 실제 믹싱에서 가장 큰 대목을 기준으로 컴프를 잡는 것과 같은 정의다. 지표도 같은 구간에서 잰다 → §22-B.
 
-> **주의**: 컴프의 threshold $T$ 는 **절대 dB** 파라미터다. 따라서 위 정규화는 컴프에 한해 결과에 직접 영향을 준다($T$ 는 $-6$ dBFS 피크 기준의 상대값이 된다). 톤/다이내믹 손실은 §12·§15 에서 보이듯 레벨 불변이므로 영향받지 않는다.
 
 ---
 
@@ -120,6 +122,8 @@ $$\Delta = \frac{\log_2 50}{J-1}\ \overset{J=17}{=}\ 0.3527\ \text{oct},\qquad \
 
 $$\Phi(f,j)=\exp\!\left(-\frac{(\log_2 f - c_j)^2}{2\sigma^2}\right)$$
 
+---
+
 **배치 (Hz)**
 $$200,\;255,\;326,\;416,\;532,\;679,\;867,\;1107,\;1414,\;1806,\;2306,\;2945,\;3761,\;4802,\;6132,\;7831,\;10000$$
 
@@ -136,18 +140,16 @@ FWHM $=2\sqrt{2\ln2}\,\sigma = 0.498$ oct.
 
 17 kHz 위의 $+43$~$+50$ dB 는 **코덱 절벽**이지 톤 차이가 아니다. 손실은 그것을 구분하지 못하고 EQ 에 거대한 컷을 요구했다.
 
+---
+
 **배치 변천**
 
 | | 범위 | $J$ | $\Delta$ | $\sigma$ | 비고 |
 |---|---|---|---|---|---|
-| 최초 | 20–20 k | 30 | 0.3436 oct | 0.2062 | 100 Hz 미만 7개가 표류 |
+| 최초 | 20–20 k | 30 | 0.3436 oct | 0.2062 |  |
 | | 100–20 k | 23 | 0.3474 oct | 0.2085 | 고역 코덱 절벽 노출 |
-| | 100–10 k | 20 | 0.3497 oct | 0.2098 | 고역 정리 |
 | **현재** | **200–10 k** | **17** | **0.3527 oct** | **0.2116** | 분리 소실 저역 제외 |
 
-네 번 모두 옥타브 간격이 $0.344$–$0.353$ 로 거의 같다 — 밴드를 잘라낸 것이 아니라 매번 새 범위에서 **다시 균일 배치**했기 때문이다.
-
-> **단일 진실 공급원**: 범위는 `pipeline.VOCAL_EQ_MIN_FREQ` / `VOCAL_EQ_MAX_FREQ` 하나에서 나온다. EQ 밴드 생성·$M_{\text{eq}}$·차트/지표 마스크는 물론, **손실의 $\Omega$ 도 `match_e2e` 가 이 상수를 `tone_fmin`/`tone_fmax` 로 명시 전달**해 같은 값을 본다. 예전에는 손실 쪽이 자기 기본값(100 Hz)을 쓰고 있어, 상수만 바꾸면 EQ 와 손실의 대역이 어긋날 수 있었다.
 
 ---
 
@@ -165,23 +167,6 @@ $$M_{\text{eq}}(f)=\mathbb{1}\big[200 \le f < 10000\ \text{Hz}\big]$$
 
 $$\boxed{\ \mathcal{G}(f)=10^{\,\alpha\,G_{\text{dB}}(f)M_{\text{eq}}(f)/20}\ },\qquad S'(f,t)=\mathcal{G}(f)S(f,t)$$
 
----
-
-### 고정 HPF/LPF 를 삭제한 이유
-
-예전에는 $80$ Hz HPF 와 $16$ kHz LPF 를 곱했다:
-
-$$M_{\text{filt}}(f)=\frac{1}{1+(f_{\text{hp}}/f)^{2p}}\cdot\frac{1}{1+(f/f_{\text{lp}})^{2p}},\qquad p=2$$
-
-이 마스크는 **출력에만** 곱해지고 레퍼런스에는 곱해지지 않는데, $L_{\text{tone}}$ 은 둘의 mel 포락선을 비교한다. 따라서 필터가 깎은 대역을 손실은 "톤이 부족하다"로 읽고 **EQ 가 그것을 되밀어 올린다** — 필터와 EQ 가 서로 반대로 일한다(실측: $8$–$20$ kHz 구간 EQ $+4.82$ dB).
-
-덤으로 차수도 틀려 있었다. 버터워스 진폭 응답은 $\lvert H\rvert=(1+(f/f_c)^{2p})^{-1/2}$ 인데 위 식은 $\lvert H\rvert^2$ 이라 dB 감쇠가 **의도의 2배**였다($f_c$ 에서 $-6.02$ dB, 정의는 $-3.01$ dB).
-
-대역 제한은 $M_{\text{eq}}$ 하나가 담당하므로 필터는 삭제했다.
-
-$$y_{\text{eq}}=\text{iSTFT}(S')$$
-
-학습 중에는 $\alpha=1$, 렌더 시에는 사용자 값(UI 기본 $0.8$)이 쓰인다 → **§18 감사 항목 A**.
 
 ---
 
@@ -191,15 +176,10 @@ $$y_{\text{eq}}=\text{iSTFT}(S')$$
 
 $$e_k=\max_{i\in[kH_d,\;kH_d+W_d)}\big\lvert u[i]\big\rvert,\qquad E_k=20\log_{10}(e_k+\epsilon)$$
 
-여기서 $u$ 는 컴프의 입력이다 — 학습 시 $u=\text{sg}[y_{\text{eq}}]$, 렌더 시 $u=y_{\text{eq}}$ (§10).
+여기서 $u$ 는 컴프의 입력이다. 학습 시 컴프는 **두 번** 호출되고 $u$ 가 서로 다르다 — 톤 경로는 $u=y_{\text{eq}}$ (그래프 연결, threshold 만 $\text{sg}$), 다이내믹 경로는 $u=\text{sg}[y_{\text{eq}}]$ 다. 렌더는 $u=y_{\text{eq}}$ (§10, §11).
 
 검출기 레이트 $f_{\text{det}}=f_s/H_d=344.53$ Hz.
 
-**왜 STFT 프레임 RMS 가 아닌가**: 목표 지표가 True Peak 를 포함한다(§15). $11.6$ ms 홉의 RMS 디텍터로 실측했을 때
-
-$$\Delta\text{LUFS}=-17.4\ \text{dB},\quad \Delta\text{TP}=-13.8\ \text{dB}\ \Rightarrow\ \Delta\text{PLR}=+3.6\ \text{dB}$$
-
-즉 게인 리덕션을 아무리 걸어도 **PLR 이 올라간다**(목표와 반대 방향). 트랜지언트를 보려면 시간 영역 피크 검출이 필요하다.
 
 패딩: $\text{pad}=(W_d-(N\bmod H_d))\bmod H_d + W_d$ 만큼 뒤에 0 을 붙여 마지막 프레임까지 창이 채워지게 한다.
 
@@ -226,27 +206,8 @@ $$G^{\text{tgt}}_k=-\,o_k\Big(1-\frac1R\Big)\ \le 0$$
 
 **파라미터 사상** — **학습 변수는 threshold 하나뿐이고 ratio 는 상수다**:
 
-$$T=-60\,\sigma(\theta_T)\in[-60,0]\ \text{dB},\qquad R \equiv \text{const}\ (\text{기본 } 3.0)$$
+$$T=-60\,\sigma(\theta_T)\in[-60,0]\ \text{dB},\qquad R \equiv \text{const}\$$
 
-$R$ 은 **학습 대상에서 뺐을 뿐 고정값은 아니다** — `COMP_RATIO`(API·UI 노출)로 곡마다 고를 수 있다. $R=1$ 은 무압축, 큰 값은 리미터에 가깝다. 상한은 $1000$ 으로 유한하게 두었다: 수식 $-o_k(1-1/R)$ 자체는 $R\to\infty$ 에서 문제없지만($1/\infty=0$), 그 값이 JSON 응답에 실려 나가는데 `Infinity` 는 유효한 JSON 이 아니다. $R=1000$ 이면 계수가 $0.999$ 라 실질적으로 리미터다.
-
-**왜 ratio 를 고정했나.** 이전에는 $R=1+e^{\theta_R}$ 로 학습했는데, 도함수가
-
-$$\frac{\partial R}{\partial\theta_R}=R-1$$
-
-이라 **컴프가 아무 일도 안 하는 지점($R=1$)에서 그래디언트가 정확히 0** 이 된다. 즉 bypass 가 흡인점이고, 한 번 그쪽으로 흘러가면 되돌릴 그래디언트가 없다. 이전 구현은 여기에 $w_a e^{-(R-1)}$ 벌점을 붙여 밀어냈지만, 그것은 기하 문제를 가린 것일 뿐이다. 파라미터를 없애면 퇴화 방향 자체가 사라지고 벌점도 필요 없다.
-
-**부수 효과 — 식별가능성 회복.** 목표는 스칼라 하나다. 해집합은
-
-$$\mathcal{S}=\big\{(T,R)\;:\;D\big(y(T,R)\big)=D_{\text{tgt}}\big\},\qquad D=\text{다이내믹 지표(현재 CF)}$$
-
-인데, $D:\mathbb{R}^2\to\mathbb{R}$ 의 준위집합이므로 $\nabla\text{PLR}\neq 0$ 인 곳에서 음함수 정리에 의해 $\mathcal{S}$ 는 **1차원 곡선**이다. 즉 최적해가 점이 아니라 선이고, 그 위에서는 손실이 평평해 어디로 갈지 데이터가 결정하지 못한다(같은 압축량을 "낮은 threshold + 약한 ratio" 로도, "높은 threshold + 강한 ratio" 로도 만들 수 있다).
-
-$R$ 을 고정하면 정의역이 1차원이 되어 준위집합이 **고립점**이 된다:
-
-$$\mathcal{S}\big|_{R\,\text{고정}}=\{T:\ D(T)=D_{\text{tgt}}\}\quad\text{— 일반적으로 유한개}$$
-
-대신 $T$ 혼자 압축량을 감당하므로 바닥($-60$ dB)에 붙을 위험이 커진다 → §16 의 threshold 심도 정규화가 그만큼 중요해졌다.
 
 ---
 
@@ -293,17 +254,21 @@ $$\boxed{\ \frac{\partial L}{\partial G^{\text{tgt}}_k}=(1-a_k)\,s_k\ }$$
 
 $$G^{\text{net}}_k=G_k-\frac{1}{\lvert\mathcal{A}\rvert}\sum_{k\in\mathcal{A}}G_k$$
 
-상수 dB 오프셋이므로 **CF 같은 레벨 불변 지표에는 영향이 없고**, 출력 레벨만 사용 가능한 범위로 되돌린다. (메이크업이 PLR 역주행의 원인이라는 가설은 실측으로 기각됐다 — §22-C.)
-
-**샘플 레이트 복원** (선형 보간) 후 곱. 학습 시에는 입력이 detach 된 것을 쓴다:
+**샘플 레이트 복원** (선형 보간) 후 곱. 학습 시 $u$ 와 $T$ 중 어느 쪽이 $\text{sg}$ 를 받는지는 경로마다 다르다:
 
 $$
 y_{\text{comp}}[n]=u[n]\cdot 10^{\,\text{interp}(G^{\text{net}})[n]/20},
 \qquad
-u=\begin{cases}\text{sg}[y_{\text{eq}}] & \text{(학습)}\\ y_{\text{eq}} & \text{(렌더)}\end{cases}
+(u,\,T)=\begin{cases}
+(y_{\text{eq}},\ \text{sg}[\theta_T]) & \text{(학습 · 톤 경로)}\\
+(\text{sg}[y_{\text{eq}}],\ \theta_T) & \text{(학습 · 다이내믹 경로)}\\
+(y_{\text{eq}},\ \theta_T) & \text{(렌더)}
+\end{cases}
 $$
 
-검출기 $E_k$ 도 같은 $u$ 에서 뽑으므로, 컴프 내부 전체가 EQ 그래프와 분리된다.
+검출기 $E_k$ 도 같은 $u$ 에서 뽑는다. 다이내믹 경로에서는 $u$ 가 끊겨 컴프 내부 전체가 EQ 그래프와 분리되지만, **톤 경로는 반대다** — $u$ 가 살아 있어 EQ 그래디언트가 컴프를 관통하고, 대신 $\text{sg}[\theta_T]$ 가 톤 손실이 컴프를 움직이는 것을 막는다(§11).
+
+---
 
 **적용량 블렌드** (병렬 컴프레션 형태):
 
@@ -319,7 +284,7 @@ $$y_{\text{dry}} = u + \rho\,(y_{\text{comp}}-u)$$
 
 손실은 하나의 스칼라로 합치지 않는다(가중치 이야기는 §16). 두 손실 모두 **체인 최종 출력**(컴프 → 리버브 통과 후)에서 재되, 그래디언트는 각자 자기 모듈로만 흐른다 — `LOSS_GRAD_MODE = "selective"`, `LOSS_MEASURE_POINT = "post_reverb"`.
 
-$\text{Rev}(\cdot)$ 는 리버브 적용 후 채널 평균(`E2EChain.apply_reverb(·).mean(0)`)이다. 리버브가 꺼져 있으면 항등 사상이므로 아래 식은 그대로 컴프 출력이 된다.
+$\text{Rev}(\cdot)$ 는 리버브 적용 후 채널 평균(`E2EChain.apply_reverb(·).mean(0)`)이다. 리버브가 꺼져 있으면 그대로 컴프 출력이 된다.
 
 $$
 y_{\text{eq}}=\text{EQ}(x;\theta),\qquad
@@ -335,16 +300,12 @@ $$
 \mathcal{L}_{\text{dyn}}(\theta_T)\;=\;L_{\text{dyn}}\big(\text{dyn}_{\text{src}}\big)\;+\;w_t\Big(\tfrac{T}{-60}\Big)^2
 $$
 
-**$\text{sg}$ 는 forward 값을 바꾸지 않는다.** 그리고 렌더(`E2EChain.forward`)와 학습이 **같은 `apply_reverb` 를 호출**한다. 따라서 두 신호와 실제 출력이 **수치적으로 완전히 동일**하다($y_{\text{full}}$ = 리버브까지 통과한 최종 출력):
+---
 
-$$\big\lVert \text{tone}_{\text{src}} - y_{\text{full}} \big\rVert_\infty = 0,\qquad
-\big\lVert \text{dyn}_{\text{src}} - y_{\text{full}}\big|_{W} \big\rVert_\infty = 0$$
-
-즉 **"손실이 듣는 소리"는 최종 출력과 같으면서, 모듈 간 간섭만 없다.**
 
 **측정 구간**: 톤은 곡 전체(장기 평균 스펙트럼이 타겟, §3), 다이내믹은 하이라이트 15초 $W$(§22-B). 컴프는 두 경우 모두 **곡 전체**에 걸고 $L_{\text{dyn}}$ 만 출력에서 $W$ 를 잘라 쓴다 — 구간을 먼저 잘라 넣으면 밸리스틱 상태가 리셋되고 오토 메이크업이 구간 평균으로 계산돼 값이 어긋난다(실측 차이 $6.7\times10^{-2}$).
 
-**학습 루프** — 두 그래프가 갈라져 있어 `retain_graph` 가 필요 없다:
+**학습 루프**
 ```
 l_tone.backward()    # θ 에만 누적
 l_dyn.backward()     # θ_T 에만 누적
@@ -353,10 +314,11 @@ optimizer.step()     # 단일 Adam, param group 으로 lr 분리
 
 $$\text{Adam},\quad \eta_{\text{EQ}}=0.05\ (\theta),\qquad \eta_{\text{comp}}=0.02\ (\theta_T),\qquad n_{\text{steps}}=50$$
 
+
+
 **초기값**: $\theta=0$ (평탄), $T_0=-30$ dB. $R$ 은 설정 상수(§7).
 
-> **다른 두 모드** (`LOSS_GRAD_MODE`): `"split"` — 톤을 컴프 **이전**($y_{\text{eq}}$)에서 잰다. 컴프가 만드는 스펙트럼 변화를 EQ 가 보지 못한다. `"unified"` — $\text{sg}$ 없이 둘 다 $y_{\text{full}}$ 에서 재고 그래디언트를 공유한다. 실패 사례가 §11-D 에 있다.
-
+<!--
 ---
 
 ## 11-B. 그래디언트 경로 — 세 모드의 대비
@@ -488,11 +450,12 @@ $$\nabla_\theta\mathcal{L}_{\text{tone}}(\theta^\ast,\theta_T^\ast)=0,\qquad \na
 2. **IR 출처가 반주다**(기본 `ir_source="instrumental"`). 반주 잔향 ≠ 레퍼런스 보컬 잔향. 더하는 웻이 타깃의 웻과 같은 공간이라는 보장이 없다.
 3. **EQ 커브가 리버브 설정에 종속된다.** `reverb_amount`·RT60·wet 을 바꾸면 최적 EQ 가 달라진다. 최종 출력 기준이라는 점에서 옳지만, EQ 결과를 리버브 설정 간에 재사용할 수 없다.
 
+-->
 ---
 
 ## 12. $L_{\text{tone}}$ — 정의 (현재)
 
-입력은 **컴프 이전 신호** $y_{\text{eq}}$ 다: $P(f,t)=\lvert\text{STFT}(y_{\text{eq}})\rvert^2$.
+입력은 **체인 최종 출력** $\text{tone}_{\text{src}}=\text{Rev}\big(\text{Comp}(y_{\text{eq}};\,\text{sg}[\theta_T])\big)$ 다 — EQ→컴프→리버브를 모두 통과하고, 컴프 파라미터 $\theta_T$ 만 detach 로 상수화된다: $P(f,t)=\lvert\text{STFT}(\text{tone}_{\text{src}})\rvert^2$.
 
 $$\bar P(f)=\frac1N\sum_t P(f,t),\qquad M(m)=\sum_f\Psi(m,f)\bar P(f),\qquad D(m)=10\log_{10}(M(m)+\epsilon)$$
 
@@ -502,12 +465,15 @@ $$\boxed{\ \tilde D(m)=D(m)-\frac{1}{\lvert\Omega\rvert}\sum_{m'\in\Omega}D(m')\
 
 $$L_{\text{tone}}=\frac{1}{\lvert\Omega\rvert}\sum_{m\in\Omega}\big\lvert \tilde D_{\text{out}}(m)-\tilde D_{\text{tgt}}(m)\big\rvert$$
 
+---
+
 **레벨 불변성**: $y\to cy \Rightarrow M\to c^2M \Rightarrow D\to D+20\log_{10}c$ (모든 $m$ 공통) $\Rightarrow$ 평균도 같은 양 이동 $\Rightarrow \tilde D$ 불변. $\square$
 
 **$L_1$ 을 쓰는 이유**: mel 밴드 하나의 큰 이상치(예: 기음 불일치)가 $L_2$ 처럼 제곱으로 증폭되지 않는다. 다만 $L_1$ 의 최적 오프셋은 **중앙값**인데 여기서는 평균을 뺀다 — 즉 $L_{\text{tone}}$ 은 오프셋에 대해 완전 최적화된 값보다 항상 크거나 같다(상계).
 
 ---
 
+<!--
 ## 13. $L_{\text{tone}}$ — 이전 정의와 민감도 비교
 
 **이전 정의** (총에너지 나눗셈):
@@ -530,9 +496,10 @@ $$\frac{\partial r^{\text{new}}_m}{\partial\Delta}=\delta_{mi}-\frac{\mathbb{1}[
 
 ---
 
-## 14. LUFS (ITU-R BS.1770-4) — 지금은 어디에 쓰이나
+-->
 
-> **$L_{\text{dyn}}$ 에서는 물러났다.** 다이내믹 손실은 크레스트 팩터로 바꿨고(§15), LUFS 는 이제 ① 믹스 밸런스·마스터링 라우드니스 매칭(이 문서 범위 밖), ② 하이라이트 구간 선택(`loudest_window`), ③ 화면 참고 수치에만 쓰인다. **아래 게이팅 구조가 곧 PLR 을 폐기한 이유**이므로 정의는 그대로 남긴다.
+## 14. LUFS (ITU-R BS.1770-4)
+
 
 K-weighting $\mathcal{K}$ = 2단 biquad (`pyloudnorm` 계수를 그대로 torch `lfilter` 로 적용):
 
@@ -568,26 +535,15 @@ $$\text{CF}=\text{TP}_{\text{dB}}-\text{RMS}_{\text{dB}}
 \qquad\Longrightarrow\qquad
 \boxed{\ L_{\text{dyn}}=\big\lvert\text{CF}_{\text{out}}-\text{CF}_{\text{tgt}}\big\rvert\ }$$
 
+---
+
 **레벨 불변성**: $y\to cy \Rightarrow \text{TP}_{\text{dB}},\ \text{RMS}_{\text{dB}}$ 가 모두 $+20\log_{10}c$ $\Rightarrow$ CF 불변. $\square$ (실측: $\times0.25/\times1/\times2$ 에서 CF $=13.5161$ 로 동일)
 
 ### 왜 PLR 에서 크레스트 팩터로 바꿨나
 
-이전 정의는 $\text{PLR}=\text{TP}_{\text{dB}}-\text{LUFS}$ 였다. 분모의 LUFS 가 K-weighting + 2단 게이팅(절대 $-70$ LUFS, 상대 $-10$ LU)을 거치는데, **그 게이팅이 압축 깊이에 따라 TP 와 다른 속도로 움직인다.** 실측(`은주막걸리`, $R=30$, thr $-18\to-50$ dB):
+이전 정의는 $\text{PLR}=\text{TP}_{\text{dB}}-\text{LUFS}$ 였다. 분모의 LUFS 가 K-weighting + 2단 게이팅(절대 $-70$ LUFS, 상대 $-10$ LU)을 거치는데, **그 게이팅이 압축 깊이에 따라 TP 와 다른 속도로 움직인다.** 
 
 $$\Delta\text{TP}=-17.8\ \text{dB},\qquad \Delta\text{LUFS}=-22.1\ \text{dB}\qquad\Rightarrow\qquad \Delta\text{PLR}=+4.4\ \text{dB}$$
-
-**세게 누를수록 PLR 이 커지는** 비단조성이다. 메이크업 게인은 원인이 아니었다 — 끄고 재현해도 재상승이 그대로였다(폭만 $0.5$–$1.0$ dB 줄어듦).
-
-RMS 에는 그런 문턱이 없어 신호 전체를 그대로 반영한다. 같은 스윕에서 CF 는 **단조 감소**한다:
-
-| thr | $-5$ | $-10$ | $-18$ | $-30$ | $-50$ | 재상승 |
-|---|---|---|---|---|---|---|
-| CF ($R=30$) | 21.89 | 20.37 | 19.43 | 17.20 | **10.47** | $+0.00$ |
-| PLR ($R=30$) | 13.83 | 13.03 | **12.77** | 13.62 | 17.15 | $\mathbf{+4.37}$ |
-
-$\sigma^{\text{ST}}$ 보조항은 이미 제거된 상태를 유지한다(§22-B). 지표 전환은 `DYN_METRIC` 로 되돌릴 수 있다.
-
-$\Rightarrow$ 게인만으로는 $L_{\text{dyn}}$ 을 낮출 수 없다(레벨 불변). 이제 **EQ 가 이 손실을 볼 일 자체가 없다**는 점도 그대로다 — §11 의 detach.
 
 ---
 
@@ -626,7 +582,7 @@ $$
 
 즉 **가중치 $w_i$ 나 EMA 정규화 $1/\hat e_i$ 는 갱신량을 바꾸지 못한다.** 손실이 하나로 합쳐져 있을 때는 $w_i$ 가 항들의 **상대** 비중을 정해서 의미가 있었지만, 분리된 뒤에는 각자가 자기 손실의 상수배라 효과가 사라진다. 학습 속도는 $\eta$ 로만 조절된다.
 
-> 남은 두 정규화는 **모듈 자신의 파라미터 제약**이지 모듈 간 침범 방지가 아니다. 침범 방지는 이제 정규화가 아니라 **그래프 구조**가 담당한다(§11-B).
+> 남은 두 정규화는 **모듈 자신의 파라미터 제약**이지 모듈 간 침범 방지가 아니다. 침범 방지는 이제 정규화가 아니라 **그래프 구조**가 담당한다.
 
 ---
 
@@ -657,11 +613,13 @@ $$
 - 소프트 리미터: 피크 $>0.88$ 일 때 $\lvert y\rvert>0.85$ 인 표본에만
 $$\hat y=\operatorname{sign}(y)\Big[0.85+0.11\tanh\frac{\lvert y\rvert-0.85}{0.11}\Big]$$
 
+
+<!--
 ---
 
 ## 18. 감사 A — 학습과 렌더의 파라미터 불일치
 
-**현상**: 학습 루프는 `chain(x_train)` 을 호출한다 → $\alpha=1,\ \rho=1$.
+**현상**: 학습 루프는 `chain(...)` 을 거치지 않고 `eq_output` → `comp` → `apply_reverb` 를 직접 조립하는데(`pipeline.py` 의 tone_src/dyn_src 생성부), 거기서 $\alpha,\rho$ 를 넘기지 않아 $\alpha=1,\ \rho=1$ 이다. ($\text{reverb\_amount}$ 만은 렌더와 같은 값이 들어간다.)
 렌더는 `chain(t_raw, eq_amount=α, comp_amount=ρ)` → UI 기본 $\alpha=0.8$.
 
 $$\theta^\ast=\arg\min_\theta \mathcal{L}\big(\text{출력}(\theta;\alpha=1)\big)\qquad\text{인데 실제 출력은}\qquad \text{출력}(\theta^\ast;\alpha=0.8)$$
@@ -699,11 +657,11 @@ $$M_{\text{filt}} = \frac{1}{1+(f/f_c)^{2p}} = \lvert H\rvert^2$$
 
 ## 20. 감사 C — 대역 경계 마스크 *(부분 해결)*
 
-**현상**: $M_{\text{eq}}$ 는 계단인데 밴드는 폭 $\sigma$ 의 가우시안이라 경계에서 커브가 잘린다. 밴드 하한을 $100$ Hz 로 올린 뒤에도 **최저 밴드($f_0=100$ Hz)의 아래쪽 절반은 여전히 마스크에 잘린다**:
+**현상**: $M_{\text{eq}}$ 는 계단인데 밴드는 폭 $\sigma$ 의 가우시안이라 경계에서 커브가 잘린다. 밴드 하한을 $200$ Hz 로 올린 뒤에도 **최저 밴드($f_0=200$ Hz)의 아래쪽 절반은 여전히 마스크에 잘린다**:
 
-$$\gamma_0\ \text{에 }+G\ \text{를 주면}\quad G_{\text{dB}}(f)=G\,e^{-(\log_2 f-\log_2 100)^2/2\sigma^2}\ \text{인데}\ f<100\ \text{에서 }0\ \text{으로 강제}$$
+$$\gamma_0\ \text{에 }+G\ \text{를 주면}\quad G_{\text{dB}}(f)=G\,e^{-(\log_2 f-\log_2 200)^2/2\sigma^2}\ \text{인데}\ f<200\ \text{에서 }0\ \text{으로 강제}$$
 
-실측: 모든 밴드 $\theta_j=0.2$ ($\gamma_j=3$ dB)일 때 커브가 $90$ Hz $= 0.00$ dB, $100$ Hz $= +4.23$ dB — 경계에서 불연속.
+하한 바로 아래는 $0$ dB, 바로 위는 $\gamma_0$ 의 가우시안 값 — 경계에서 불연속이다.
 
 **남은 문제 (해결 안 됨) — 경계에서 손실이 눈을 반쯤 감는다.**
 
@@ -733,9 +691,9 @@ $$\frac{\partial R_{\text{eq}}}{\partial\gamma_6}= \frac{2\lambda_2\gamma_6}{J}+
 
 $\gamma_6$(84 Hz)은 손실로부터 약한 신호만 받으므로 이 식이 지배했고, **데이터 항이 없는 밴드가 평활항을 통해 살아 있는 밴드($\gamma_7$)를 끌어당겼다.**
 
-**해결**: 밴드 하한을 $100$ Hz 로 올려 문제의 밴드 7개를 제거했다. 이제 모든 $\gamma_j$ 가 평가 대역 안에 중심을 두므로 정규화항의 모든 항이 데이터 신호를 받는 파라미터에 걸린다.
+**해결**: 밴드 하한을 $100$ Hz 로, 이어서 $200$ Hz 로 올려 문제의 밴드들을 제거했다. 이제 모든 $\gamma_j$ 가 평가 대역 $\Omega$ 안에 중심을 두므로 정규화항의 모든 항이 데이터 신호를 받는 파라미터에 걸린다.
 
-$$J:\ 30\to23,\qquad \#\{j: f_j<100\}:\ 7\to 0$$
+$$J:\ 30\to23\to\mathbf{17},\qquad \#\{j: f_j<f_{\min}\}:\ 7\to 0\qquad(f_{\min}:\ 20\to100\to\mathbf{200}\ \text{Hz})$$
 
 > 남은 미세한 비대칭: 최저 밴드 $\gamma_0$ 는 가우시안 아래쪽 절반이 마스크에 잘리고, 그 위 $200$–$260$ Hz 도 손실에 $36$–$80\%$ 만 반영된다(§20). 즉 유효 기여가 다른 밴드보다 작다. 밴드별 유효 가중 $\nu_j=\sum_f\Phi(f,j)M_{\text{eq}}(f)\big/\sum_f\Phi(f,j)$ 로 $R_{\text{eq}}$ 를 정규화하면 완전히 없앨 수 있으나, 밴드 1개의 문제라 현재는 두었다.
 
@@ -753,8 +711,8 @@ $$J:\ 30\to23,\qquad \#\{j: f_j<100\}:\ 7\to 0$$
 | E6 | 잔여 지표 | `compression_data` 의 crest factor·rms_var 은 더 이상 최적화 대상이 아님 | 화면 해석 혼란 |
 | E7 | ~~ratio 고정값~~ | **해결**: $R$ 을 $[1,1000]$ 설정 상수로 노출했다(`COMP_RATIO`, UI 슬라이더 1–30). CF 지표에서는 $R$ 이 클수록 도달 가능 범위가 넓어진다 — 실측 $R{=}3$ 은 $T{=}-50$ 에서 CF 17.71 이 한계지만 $R{=}30$ 은 10.47 까지 내려가 목표(12.16)를 지난다 | 소재별 적정값은 사용자가 고른다(장르에 따라 3–30) |
 | E8 | $L_1$ 오프셋 | 평균을 빼지만 $L_1$ 최적 오프셋은 중앙값 | 손실이 상계로 계산됨 |
-| E9 | ~~톤 측정 지점~~ | **재평가 완료**: 톤을 컴프 **이후**($y_{\text{full}}$)에서 재도록 바꿨다(§11-D). 실측 결과 톤은 $2.553\to2.593$ ($1.6\%$ 악화)에 그치고 다이내믹은 $0.455\to0.137$ 개선 → 종합 개선. 시변 게인 잔차는 남지만 크기가 확인됐다 | 해소 — 남은 잔차는 §11-D 참조 |
-| E10 | ~~EQ 저역 붕괴~~ | **해결**: `unified` 에서 EQ 가 저역을 $-19.9$ dB 까지 파내던 문제. $L_{\text{dyn}}$ 이 $\theta$ 로도 흘러 EQ 가 스펙트럼을 깎아 다이내믹을 대신 맞춘 것이 원인이었고, `selective` 로 경로를 끊어 $-7.6$ dB 로 정상화(§11-D) | 해소 |
+| E9 | ~~톤 측정 지점~~ | **재평가 완료**: 톤을 컴프 **이후**($y_{\text{full}}$)에서 재도록 바꿨다. 실측 결과 톤은 $2.553\to2.593$ ($1.6\%$ 악화)에 그치고 다이내믹은 $0.455\to0.137$ 개선 → 종합 개선. 시변 게인 잔차는 남지만 크기가 확인됐다 | 해소 |
+| E10 | ~~EQ 저역 붕괴~~ | **해결**: `unified` 에서 EQ 가 저역을 $-19.9$ dB 까지 파내던 문제. $L_{\text{dyn}}$ 이 $\theta$ 로도 흘러 EQ 가 스펙트럼을 깎아 다이내믹을 대신 맞춘 것이 원인이었고, `selective` 로 경로를 끊어 $-7.6$ dB 로 정상화 | 해소 |
 
 ---
 
@@ -871,12 +829,12 @@ $\Rightarrow$ 원인은 다른 곳에 있다. 다음 진단이 §15 의 LUFS 게
 | # | 변경 | 이전 | 현재 | 근거 |
 |---|---|---|---|---|
 | 1 | 손실 그래디언트 구조 | split ($\text{sg}$, 톤은 컴프 이전) | 잠시 **unified** (결합) | 톤을 최종 출력에서 재려는 시도 |
-| 2 | ↳ 되돌림 | unified | **selective** (측정은 최종 출력, 경로는 분리) | unified 에서 EQ 저역 $-19.9$ dB 붕괴 (§11-D) |
+| 2 | ↳ 되돌림 | unified | **selective** (측정은 최종 출력, 경로는 분리) | unified 에서 EQ 저역 $-19.9$ dB 붕괴 |
 | 3 | 컴프 학습·평가 구간 | 곡 전체 | **하이라이트 15 s** (학습·지표 동일 구간) | §22-B |
 | 4 | $L_{\text{dyn}}$ 보조항 | $+\tfrac12\lvert\Delta\sigma^{\text{ST}}\rvert$ | **제거** | 보조항이 손실을 지배해 컴프가 감쇠기로 변질 (§22-B) |
 | 5 | ratio | 학습 → 상수 $3.0$ 고정 | **설정 상수** $[1,1000]$, 기본 $3.0$ | 소재별 조정 필요 (§7, E7) |
 | 6 | $L_{\text{dyn}}$ 지표 | PLR $=$ TP $-$ LUFS | **CF $=$ TP $-$ RMS** | LUFS 게이팅발 비단조성 (§15) |
-| 7 | 손실 측정 지점 | 컴프 출력 (리버브 전) | **체인 최종 출력** (`LOSS_MEASURE_POINT="post_reverb"`) | 손실과 보고 지표가 다른 신호를 보고 있었음. 8개 지표 전부 개선, 청감 확인 후 채택 (§11-E) |
+| 7 | 손실 측정 지점 | 컴프 출력 (리버브 전) | **체인 최종 출력** (`LOSS_MEASURE_POINT="post_reverb"`) | 손실과 보고 지표가 다른 신호를 보고 있었음. 8개 지표 전부 개선, 청감 확인 후 채택 |
 
 **비동치 — 이전 세션 (참고)**
 
@@ -896,7 +854,9 @@ $\Rightarrow$ 원인은 다른 곳에 있다. 다음 진단이 §15 의 LUFS 게
 5. §19 B: 타깃에도 대역 제한을 걸었을 때 고역 부스트가 사라지는가 — 해소(필터 삭제)
 6. GR 이 큰 소재에서 톤 악화가 어디까지 가는가 — 미확인
 
+
 ---
+
 
 ## 24. 요약 — 이번 세션의 진단 사슬
 
@@ -944,8 +904,9 @@ $\Rightarrow$ 원인은 다른 곳에 있다. 다음 진단이 §15 의 LUFS 게
 | 항목 | 상태 |
 |---|---|
 | $\sigma^{\text{ST}}$ 재도입(창 축소 / 분위수 곡선) | 보류 — CF 전환으로 필요성 낮아짐 (§22-B) |
-| 학습/렌더 측정 지점 불일치(리버브) | **해결** — 손실을 리버브 뒤로 이동 (§11-E) |
+| 학습/렌더 측정 지점 불일치(리버브) | **해결** — 손실을 리버브 뒤로 이동 |
 | 학습/렌더 $\alpha,\rho$ 불일치 | 미해결 (§18 A). 리버브는 맞췄고 EQ·컴프 적용량은 그대로 |
-| 레퍼런스 디리버브(`ref_dry`) — "웻+웻 대 웻" 비대칭 | 미착수 (§11-E) |
+| 레퍼런스 디리버브(`ref_dry`) — "웻+웻 대 웻" 비대칭 | 미착수 |
 | 대역 경계 마스크 계단 | 부분 해결 (§20) |
 | 소재별 적정 ratio 자동 추정 | 미착수 |
+-->

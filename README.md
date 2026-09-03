@@ -75,6 +75,10 @@ backward:  L_tone ← tone_src = Reverb(Comp(y_eq, sg[θ_T])) → θ   (EQ)
 tone_src = chain.comp(y_eq, detach_params=True)   # Comp(y_eq, sg[θ_T])
 dyn_src  = chain.comp(y_eq.detach())              # Comp(sg[y_eq], θ_T)
 
+# LOSS_MEASURE_POINT = "post_reverb" (기본) → 둘 다 리버브를 한 번 더 통과한 뒤 손실로
+tone_src = chain.apply_reverb(tone_src, reverb_amount).mean(dim=0)
+dyn_src  = chain.apply_reverb(dyn_src,  reverb_amount).mean(dim=0)
+
 L_tone_total = criterion.tone_loss(tone_src, target) + eq_l2 항 + eq_smooth 항  # θ 로만
 L_dyn_total  = criterion.dyn_loss(dyn_src,  target) + comp_thresh 항            # θ_T 로만
 
@@ -141,7 +145,7 @@ EDC_db(k) − EDC_db(0)
 
 | 항 | 소속 | 식 | 목적 |
 |---|---|---|---|
-| `eq_l2` (기본 0.01) | `L_tone_total` | `mean(γ²)` | 전체 부스트/컷 폭 억제 |
+| `eq_l2` (기본 0.1) | `L_tone_total` | `mean(γ²)` | 전체 부스트/컷 폭 억제 |
 | `eq_smooth` (기본 0.1) | `L_tone_total` | `mean(diff(γ)²)` | 인접 밴드 요철 억제 → 매끈한 커브 선호 |
 | `comp_thresh_weight` (기본 0) | `L_dyn_total` | `(threshold / -60)²` | threshold 를 내리는 쪽 그래디언트 지렛대가 길어 목표 다이내믹 지표를 threshold 바닥으로 맞춰 버리면 **컴프가 아니라 포락선 스케일러**가 됩니다. ratio 고정 이후 threshold 혼자 압축량을 감당하므로 더 중요해졌습니다 |
 
@@ -165,10 +169,12 @@ EDC_db(k) − EDC_db(0)
 
 ### 컴프레서 설계 (`modules.DifferentiableCompressor`)
 
-**학습 파라미터는 threshold 하나뿐**이고, **ratio 는 3:1 상수**, 시정수도 상수입니다.
+**학습 파라미터는 threshold 하나뿐**이고, **ratio 는 사용자가 고르는 상수**(기본 3:1), 시정수도 상수입니다.
 
-* **파라미터화**: `threshold = −60·σ(raw)` → [−60, 0] dB. ratio 는 `register_buffer` 로 고정.
+* **파라미터화**: `threshold = −60·σ(raw)` → [−60, 0] dB. ratio 는 파라미터도 버퍼도 아닌 **평범한 float** 입니다 — 그래프에 없다는 것이 코드에서 바로 보이게 하려는 의도입니다.
+* **ratio 는 학습하지 않을 뿐 고정값은 아닙니다**: `pipeline.COMP_RATIO`(기본 3.0)로 잡고 API `comp_ratio` · UI 슬라이더(1~30)로 곡마다 바꿉니다. 허용 범위는 `[1, 1000]` — 1 은 무압축, 큰 값은 사실상 리미터입니다. 상한을 유한하게 둔 이유는 게인 식 `−o·(1 − 1/R)` 자체는 `R = inf` 를 문제없이 처리하지만(`1/inf = 0`) 그 값이 JSON 응답에 실려 나가는데 `Infinity` 가 유효한 JSON 이 아니기 때문입니다(프론트의 `JSON.parse` 가 던집니다). `R = 1000` 이면 계수가 0.999 라 실용적으로 리미터입니다.
 * **왜 ratio 를 학습하지 않는가**: 이전 파라미터화 `ratio = 1 + exp(raw)` 의 도함수는 `d(ratio)/d(raw) = ratio − 1` 이라, **컴프가 아무 일도 하지 않는 지점(ratio=1)에서 그래디언트가 정확히 0** 이 됩니다. bypass 가 흡인점이 되어 한 번 그쪽으로 흘러가면 되돌릴 힘이 없습니다. 예전에는 `exp(-(ratio-1))` 벌점으로 밀어냈지만 그건 기하 문제를 가린 것이고, 파라미터를 없애면 퇴화 방향 자체가 사라집니다.
+* **ratio 가 도달 범위를 정합니다**(크레스트 팩터 지표 기준 실측, `은주막걸리` 소재): `R=3` 은 threshold 를 −50 dB 까지 내려도 CF 17.71 이 한계지만, `R=30` 이면 10.47 까지 내려가 목표 12.16 을 지납니다. 소재가 목표에 못 닿으면 threshold 가 아니라 ratio 를 올리는 것이 맞습니다.
 * **부수 효과**: `(threshold, ratio)` 축퇴도 함께 사라집니다. 같은 다이내믹 감소를 만드는 조합이 무수히 많은데 목표는 스칼라 하나(다이내믹 레인지 지표)뿐이라 둘 다 자유로우면 해가 약하게만 결정됐습니다. 대신 threshold 혼자 압축량을 감당하므로 바닥에 붙을 위험이 커져 `comp_thresh_weight` 의 역할이 커졌습니다.
 * **시간 영역 피크 디텍터 (hop 128 ≈ 2.9 ms)**: STFT 프레임 RMS 디텍터로 재봤더니 128초 보컬에서 지속 음량은 17.4 dB 내려가는데 True Peak 는 13.8 dB 만 내려가 **다이내믹 지표가 오히려 올라갔습니다(당시 PLR 기준 14.2 → 17.8 dB)**. 11.6 ms 홉의 RMS 로는 짧은 트랜지언트를 볼 수 없습니다 — 분모만 움직이고 피크는 남으므로 실패 양상은 크레스트 팩터에서도 같습니다.
 * **밸리스틱 (one-pole, 어택 0.5 ms / 릴리즈 120 ms 상수)**: 이게 없으면 시정수가 아예 없어 컴프가 아니라 게인 오토메이션입니다. 계수를 학습 대상으로 만들면 threshold 와 뒤엉켜 최적화만 어려워집니다.
@@ -338,7 +344,8 @@ Rec-RIR 추정이 실패하거나 사용자가 선택하면 기존 지수감쇠 
 * **모듈 토글 그리드**: EQ / Comp / Reverb 를 독립적으로 On/Off.
 * **리버브 방식 & IR 소스 선택**: `measured`(Rec-RIR) / `synth`, `instrumental` / `reference`. **리버브 조합 비교**를 켜면 4조합을 한 번에 렌더해 즉시 A/B.
 * **단일 매칭 슬라이더 + 잔향량 슬라이더**: 매칭 강도(기본 0.8)와 잔향 센드량(기본 0.3)을 1-Knob 로 조작.
-* **최적화 페널티 슬라이더**: `EQ L2` / `EQ Smooth` / `Comp Anchor` / `Comp Threshold` — 논문 그림용 A/B 를 UI 에서 바로 만들 수 있습니다. 사용한 값은 응답 `penalties` 에 기록되어 돌아옵니다.
+* **컴프 압축비 슬라이더 (`Ratio`, 1~30, 기본 3)**: 학습 대상이 아니라 직접 고르는 값입니다. threshold 는 이 값에 맞춰 학습됩니다.
+* **최적화 페널티 슬라이더**: `EQ L2` / `EQ Smooth` / `Comp Threshold` — 논문 그림용 A/B 를 UI 에서 바로 만들 수 있습니다. 사용한 값은 응답 `penalties` 에 기록되어 돌아옵니다. (`Comp Anchor` 는 ratio 를 학습에서 뺀 뒤 불필요해져 삭제했습니다.)
 * **모니터링 카드**: 음색 오차(EQ MAE)와 3개 포락선 차트, **다이내믹 레인지 3단(원본 → 레퍼런스 목표 → 결과)** 과 최대 GR·threshold·ratio·어택/릴리즈, **IR 지표**(RT60 / EDT / DRR / C80 / 대역별 감쇠), 마스터링(레퍼런스 LUFS · 메이크업 · 최종 피크/실링).
 * **A/B 플레이어**: 원본 / 레퍼런스(분리 시 추출 보컬 + 원곡) / 처리 결과 / 처리 전 풀믹스 / 처리 후 풀믹스 / 마스터.
 
@@ -416,7 +423,24 @@ threshold 와 강하게 뒤엉켜 손실 지형만 나빠지고, 실제 믹싱�
 ```bash
 git clone https://github.com/Audio-WestlakeU/Rec-RIR.git
 ```
-체크포인트 `Rec-RIR/ckpt/epoch35.tar` 와 설정 `Rec-RIR/config/Rec-RIR.toml` 이 있어야 IR 추정이 동작합니다. 없으면 합성 리버브 폴백(`reverb_mode="synth"`)으로만 실행됩니다.
+체크포인트 `Rec-RIR/ckpt/epoch35.tar` 와 설정 `Rec-RIR/config/Rec-RIR.toml` 이 있어야 IR 추정이 동작합니다.
+
+> ⚠️ **Rec-RIR 이 없으면 `reverb_mode="measured"` 요청은 실패합니다(HTTP 500).** 자동 폴백이 아닙니다 —
+> `recrir_ir.py` 의 모델 로드에 예외 처리가 없어 `FileNotFoundError` 가 그대로 API 까지 올라갑니다.
+> **기본값인 `manual` 과 `synth` 는 Rec-RIR 없이 정상 동작**하므로, 측정 IR 을 쓰지 않을 계획이면
+> (a) 를 건너뛰어도 됩니다. EQ·컴프·Demucs 분리·풀믹스·마스터링은 모두 Rec-RIR 과 무관합니다.
+
+또한 Rec-RIR 모델은 `requirements.txt` 에 없는 패키지를 추가로 요구합니다 — 측정 IR 을 쓸 때만 필요합니다.
+
+```bash
+./venv/bin/pip install toml einops
+# mamba_ssm 은 CUDA 빌드가 필요해 CPU 전용 환경에서는 설치가 실패할 수 있습니다.
+# 실패하면 measured 모드만 사용할 수 없고 나머지 기능은 그대로입니다.
+./venv/bin/pip install mamba_ssm
+```
+
+`Dockerfile` 에는 Rec-RIR 클론 단계가 없습니다. 컨테이너에서 측정 IR 을 쓰려면
+`Rec-RIR/`(체크포인트 포함)을 볼륨으로 마운트하십시오.
 
 **(b) 가상환경 생성**
 ```bash

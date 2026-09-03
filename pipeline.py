@@ -6,8 +6,9 @@ End-to-End Joint Training 파이프라인.
 모듈별로 분리된 손실(`losses.DSPMatchingLoss`)로 각각 역전파한다.
 
     forward:   STFT → EQ → iSTFT → Compressor → Reverb        (직렬, numpy 왕복 0회)
-    backward:  L_tone ← y_eq                → θ (EQ)          (경로 분리)
-               L_dyn  ← y_full = Comp(y_eq.detach())  → θ_T (Comp)
+    backward:  L_tone ← tone_src = Rev(Comp(y_eq, sg[θ_T])) → θ   (EQ)   (경로 분리)
+               L_dyn  ← dyn_src  = Rev(Comp(sg[y_eq], θ_T)) → θ_T (Comp)
+               ※ 리버브 통과 여부는 LOSS_MEASURE_POINT ("post_reverb" 기본)
 
 각 손실이 자기 모듈만 움직인다는 성질을 **그래디언트 경로를 끊어서** 보장한다. 예전에는
 세 손실을 가중합으로 묶고 침범 방지용 정규화 항으로 통제했는데, 구조로 보장되므로 그
@@ -109,6 +110,8 @@ COMP_TRAIN_SECONDS: Optional[float] = 15.0
 #   "selective" (기본) — 두 손실 모두 컴프 통과 후 신호에서 재되, 경로는 갈라 둔다.
 #         tone_src = Comp(y_eq, sg[θ_T])   ← θ 로만 흐름 (컴프 파라미터 고정)
 #         dyn_src  = Comp(sg[y_eq], θ_T)   ← θ_T 로만 흐름 (컴프 입력 고정)
+#       (기본값 LOSS_MEASURE_POINT="post_reverb" 에서는 두 신호가 여기서 리버브를 한 번
+#        더 통과한 뒤 손실에 들어간다 — 아래 LOSS_MEASURE_POINT 주석 참조.)
 #       sg 는 forward 값을 바꾸지 않으므로 두 신호와 실제 출력이 **수치적으로 동일**하다.
 #       "손실이 듣는 소리"는 최종 출력과 같으면서, 모듈 간 간섭은 없다.
 #
@@ -710,14 +713,10 @@ class E2EChain(nn.Module):
         잡아야 다이내믹 지표를 실제로 낮출 수 있다.
 
         Args:
-            detach_comp_input: True 면 컴프 입력에서 그래프를 끊는다. 학습 시 손실
-                경로를 분리하기 위한 스위치다 — 톤 손실은 EQ 출력에서, 다이내믹 손실은
-                컴프 출력에서 재는데, 이 detach 가 없으면 다이내믹 손실의 그래디언트가
-                컴프를 통과해 EQ 까지 흘러가 EQ 가 스펙트럼을 왜곡하는 방식으로 다이내믹
-                수치를 낮추려 한다. 끊어 두면 각 손실이 자기 모듈만 움직인다.
-                (렌더링 시에는 의미가 없으므로 False.)
-            return_stages: True 면 `(y_eq, y_comp)` 를 함께 돌려준다. 학습 루프가 두
-                지점에서 각각 손실을 재기 위해 쓴다.
+            detach_comp_input / return_stages: **현재 호출부가 없다.** 학습 루프가
+                `to_dry` 대신 `eq_output` → `comp` → `apply_reverb` 를 직접 조립하도록
+                바뀌면서(`match_e2e` 의 tone_src/dyn_src 생성부) 남은 스위치다. 지금
+                `to_dry` 는 렌더(`forward`) 전용 경로다.
             comp_window: `(start, end)` 를 주면 컴프를 **그 구간에만** 적용한다. 학습에서
                 다이내믹 손실을 곡 전체가 아니라 최대 볼륨 구간으로 재기 위한 것이다.
                 이때 반환값은 `(곡 전체 y_eq, 구간 길이의 컴프 출력)` 으로 길이가 다르다.
@@ -827,7 +826,7 @@ def match_e2e(
     lr_eq: float = 0.05,
     lr_comp: float = 0.02,
     lr_reverb: float = 0.05,
-    eq_l2: float = 0.01,
+    eq_l2: float = 0.1,
     eq_smooth: float = 0.1,
     comp_thresh_weight: float = 0.0,
     verbose: bool = True,

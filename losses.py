@@ -8,13 +8,20 @@ DSPMatchingLoss — EQ / Compressor / Reverb 매칭 손실.
 모두 출력 한 점에서 체인 전체로 흘렀기 때문에, EQ 가 다른 모듈의 손실을 우회적으로
 낮추는 것을 막으려면 별도의 정규화 항(anchor)이 필요했다.
 
-지금은 **그래디언트 경로 자체를 끊는다**(`pipeline.py` 의 `E2EChain.to_dry` 참조):
+지금은 **그래디언트 경로 자체를 끊는다**(`pipeline.py` 의 학습 루프 `match_e2e` 참조.
+기본값 `LOSS_GRAD_MODE="selective"` + `LOSS_MEASURE_POINT="post_reverb"`):
 
-    y_eq   = EQ(x, θ)                     ← L_tone 이 여기서 측정된다
-    y_full = Comp(y_eq.detach(), θ_T)     ← L_dyn 이 여기서 측정된다
+    y_eq     = EQ(x, θ)
+    tone_src = Rev(Comp(y_eq, sg[θ_T]))       ← L_tone 이 여기서 측정된다
+    dyn_src  = Rev(Comp(sg[y_eq], θ_T))       ← L_dyn 이 여기서 측정된다
 
-    L_tone_total = tone_loss(y_eq)  + eq_l2 + eq_smooth   → θ 로만 흐름
-    L_dyn_total  = dyn_loss(y_full) + comp_thresh         → θ_T 로만 흐름
+    L_tone_total = tone_loss(tone_src) + eq_l2 + eq_smooth   → θ 로만 흐름
+    L_dyn_total  = dyn_loss(dyn_src)   + comp_thresh         → θ_T 로만 흐름
+
+`sg[·]` 는 stop-gradient(detach)다. **신호 값은 바꾸지 않는다** — 두 손실이 듣는 소리는
+실제 최종 출력과 수치적으로 동일하고, 그래디언트만 각자 자기 모듈로 간다. L_tone 의 입력은
+tone_src — EQ→컴프→리버브를 모두 통과한 최종 출력이며, 컴프 파라미터만 detach 로
+상수화되어 그래디언트는 EQ(θ)로만 흐른다.
 
 각 손실이 특정 모듈만 낮출 수 있다는 성질이 **구조적으로** 보장되므로, 침범 방지 목적의
 정규화 항은 더 이상 필요 없다(`comp_anchor` 삭제). 남은 정규화는 모두 모듈 자신의
@@ -237,8 +244,8 @@ class DSPMatchingLoss(nn.Module):
 
     사용법:
         loss = DSPMatchingLoss(...)
-        l_tone, d1 = loss.tone_loss(y_eq,   target)     # θ 로만 흐름
-        l_dyn,  d2 = loss.dyn_loss(y_full,  target, compressor=comp)
+        l_tone, d1 = loss.tone_loss(tone_src, target)   # θ 로만 흐름
+        l_dyn,  d2 = loss.dyn_loss(dyn_src,   target, compressor=comp)
         (l_tone + eq_reg).backward()
         (l_dyn).backward()
 
@@ -740,9 +747,12 @@ class DSPMatchingLoss(nn.Module):
         tone_power_out: Optional[torch.Tensor] = None,
         tone_power_tgt: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """EQ 손실. `output_audio` 는 **EQ 직후 신호**(컴프 이전)를 넣는다.
+        """EQ 손실. 신호 출처를 가리지 않는 **범용 함수** — 무엇을 넣을지는 호출부가 정한다.
 
-        호출부가 컴프 입력을 detach 하므로 이 손실의 그래디언트는 EQ 파라미터로만 간다.
+        기본 설정(`LOSS_GRAD_MODE="selective"` + `LOSS_MEASURE_POINT="post_reverb"`)에서
+        학습 루프가 넣는 것은 `tone_src` — EQ→컴프→리버브를 모두 통과한 최종 출력이며,
+        컴프 파라미터만 detach 로 상수화되어 그래디언트는 EQ(θ)로만 흐른다.
+        (`pipeline.py` 의 tone_src 생성부와 아래 `_loss_tone` docstring 참조.)
 
         Args:
             output_audio: [B, T] 또는 [B, C, T]. 그래프에 연결된 텐서.
@@ -771,9 +781,11 @@ class DSPMatchingLoss(nn.Module):
         sample_rate: Optional[int] = None,
         compressor: Optional[nn.Module] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compressor 손실. `output_audio` 는 **컴프 통과 후 신호**를 넣는다.
+        """Compressor 손실. 신호 출처를 가리지 않는 **범용 함수**다.
 
-        컴프 입력이 detach 되어 있으므로 그래디언트는 컴프 파라미터(threshold)로만 간다.
+        학습 루프가 넣는 것은 `dyn_src` — 컴프(+`post_reverb` 기본값에서는 리버브까지)를
+        통과한 신호다. 컴프 입력이 detach 되어 있으므로 그래디언트는 컴프
+        파라미터(threshold)로만 간다.
 
         `comp_thresh_weight > 0` 이면 threshold 심도 정규화가 여기에 포함된다.
         threshold 를 내리는 쪽은 그래디언트 지렛대가 길어서(활성 프레임 수까지 함께

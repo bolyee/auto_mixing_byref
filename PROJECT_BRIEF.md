@@ -251,6 +251,11 @@ mag_dry = sqrt(P_dry)                      # 위상은 원본 STFT 위상 재사
 같은 θ의 `rt60`을 그대로 쓴다. 전부 미분가능.
 
 ### 8.4 손실 (raw와 ref는 다른 연주 → 파형 정렬 불가, 통계 도메인으로)
+
+> ⚠️ **미구현 설계안이다.** 아래 가중합(`w1..w5`)과 `y_dry`/`ref_dry`(디리버브 전제)는
+> 현행 코드와 다르다. 현재는 손실을 합치지 않고 각각 backward 하며, `L_tone` 의 입력은
+> `tone_src` — EQ→컴프→리버브를 모두 통과한 최종 출력이다. `L_cycle`·`L_dry` 는 없다.
+> 현행 구조는 README "DSPMatchingLoss" 절 참조.
 ```
 L = w1·L_tone     # mel 포락선: melenv(y_dry) vs melenv(ref_dry)
   + w2·L_dyn      # RMS 분위수 곡선: quantile(y_dry) vs quantile(ref_dry)
