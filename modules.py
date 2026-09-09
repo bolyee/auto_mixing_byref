@@ -119,14 +119,17 @@ class DifferentiableEQ(nn.Module):
     the tone loss evaluation band exactly. The mastering EQ keeps the full
     20 Hz – 20 kHz range, since there the whole spectrum is being matched.
     """
-    def __init__(self, sample_rate, n_fft, num_bands=31, min_freq=20.0, max_freq=20000.0, max_gain_db=15.0,
-                 hard_clamp=True):
+    def __init__(self, sample_rate, n_fft, num_bands=31, min_freq=20.0, max_freq=20000.0,
+                 gain_scale_db=15.0, hard_clamp=True, max_gain_db=None):
         super().__init__()
+        if max_gain_db is not None:
+            gain_scale_db = max_gain_db
+        self.gain_scale_db = float(gain_scale_db)
+        self.max_gain_db = self.gain_scale_db  # 하위 호환성 유지용 별칭
         self.hard_clamp = hard_clamp
         self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.num_bands = num_bands
-        self.max_gain_db = max_gain_db
         
         # 1. Compute frequency bins for STFT
         self.n_freqs = n_fft // 2 + 1
@@ -156,15 +159,15 @@ class DifferentiableEQ(nn.Module):
         self.theta = nn.Parameter(torch.zeros(num_bands, dtype=torch.float32))
         
     def get_eq_curve_db(self):
-        # hard_clamp=True: tanh 로 ±max_gain_db 에 가둔다(legacy / 마스터링 EQ).
+        # hard_clamp=True: tanh 로 ±gain_scale_db 에 가둔다(legacy / 마스터링 EQ).
         # hard_clamp=False: 상한 없이 선형. 게인 크기 제어는 손실의 제곱 페널티가 맡는다.
         #   tanh 는 상한에 닿기 전까지 저항이 0 이라 결국 "일단 밀고 벽에서 잘리는"
         #   사후 절단과 같아진다. 기울기 스케일은 원점에서의 tanh 와 동일하게 맞춰
-        #   (d/dθ = max_gain_db) 학습률을 그대로 쓸 수 있게 한다.
+        #   (d/dθ = gain_scale_db) 학습률을 그대로 쓸 수 있게 한다.
         if self.hard_clamp:
-            band_gains_db = self.max_gain_db * torch.tanh(self.theta)
+            band_gains_db = self.gain_scale_db * torch.tanh(self.theta)
         else:
-            band_gains_db = self.max_gain_db * self.theta
+            band_gains_db = self.gain_scale_db * self.theta
         eq_curve_db = torch.matmul(self.Phi, band_gains_db)
         return eq_curve_db, band_gains_db
 
@@ -410,6 +413,130 @@ class DifferentiableCompressor(nn.Module):
         return out
 
 
+class DifferentiableLimiter(nn.Module):
+    """
+    미분 가능한 마스터링 리미터 (Differentiable Mastering Limiter / Maximizer).
+
+    DifferentiableCompressor의 밸리스틱과 Soft-knee를 기반으로 하되,
+    마스터링 환경에 맞춰 설계:
+    1. Stereo-linked: [ch, T] 스테레오 신호에서 L/R 최대 피크를 감지하여 중앙 이미지 보존
+    2. 리미터 파라미터:
+       - Ratio: 50.0:1 (벽으로 작동)
+       - Attack: 0.1 ms (즉각적인 피크 억제)
+       - Release: 80.0 ms (자연스러운 지수 릴리즈)
+       - Knee: 1.0 dB (미세 소프트니로 역전파 미분 가능성 확보)
+       - Ceiling: -0.3 dBFS (절대 천장)
+    3. 맥시마이저 볼륨 드라이브:
+       - 천장(Ceiling)을 고정하고 인풋 게인(input_gain_db)을 올려서 천장에 밀어 넣는 구조
+    """
+    def __init__(self, sample_rate=44100, ceiling_db=-0.3, ratio=50.0,
+                 attack_ms=0.1, release_ms=80.0, knee_db=1.0, detector_hop=64):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.ceiling_db = ceiling_db
+        self.ratio = ratio
+        self.attack_ms = attack_ms
+        self.release_ms = release_ms
+        self.knee_db = knee_db
+        self.detector_hop = detector_hop
+        self.detector_win = detector_hop * 2
+
+        # 밸리스틱 1차 계수
+        dt = detector_hop / sample_rate
+        self.register_buffer('a_att', torch.tensor(np.exp(-dt / (attack_ms / 1000.0)), dtype=torch.float32))
+        self.register_buffer('a_rel', torch.tensor(np.exp(-dt / (release_ms / 1000.0)), dtype=torch.float32))
+
+    def forward(self, x, input_gain_db=0.0, return_gr=False):
+        """
+        Args:
+            x: [T] 또는 [ch, T] 텐서/numpy 배열.
+            input_gain_db: 볼륨을 올려서 리미터로 밀어 넣는 인풋 게인 (dB).
+            return_gr: True 이면 (out, gr_stats) 반환.
+        """
+        is_numpy = isinstance(x, np.ndarray)
+        if is_numpy:
+            x_tensor = torch.from_numpy(x).float()
+        else:
+            x_tensor = x
+
+        # 1. 인풋 게인 (볼륨 밀어올리기) - 텐서일 경우 autograd 그래프 유지
+        if isinstance(input_gain_db, torch.Tensor):
+            drive_lin = torch.pow(10.0, input_gain_db / 20.0)
+            x_driven = x_tensor * drive_lin
+        elif input_gain_db != 0.0:
+            drive_lin = 10.0 ** (input_gain_db / 20.0)
+            x_driven = x_tensor * drive_lin
+        else:
+            x_driven = x_tensor
+
+        orig_dim = x_driven.dim()
+        if orig_dim == 1:
+            x_in = x_driven.unsqueeze(0)
+        else:
+            x_in = x_driven
+
+        ch, n = x_in.shape
+        hop, win = self.detector_hop, self.detector_win
+        pad = (win - (n % hop)) % hop + win
+        x_pad = torch.nn.functional.pad(x_in, (0, pad))
+
+        # 스테레오 링크 피크 검출: 채널별 윈도우 중 최대값 -> L/R 채널 간 최대값
+        env = x_pad.unfold(-1, win, hop).abs().amax(dim=-1).amax(dim=0)
+        epsilon = 1e-8
+        env_db = 20.0 * torch.log10(env + epsilon)
+
+        # 소프트니 기반 오버슛 계산 (Threshold = ceiling_db)
+        threshold = self.ceiling_db
+        half_knee = self.knee_db / 2.0
+        diff = env_db - threshold
+        overshoot = torch.where(
+            diff < -half_knee,
+            torch.zeros_like(diff),
+            torch.where(
+                diff > half_knee,
+                diff,
+                (diff + half_knee) ** 2 / (2.0 * self.knee_db)
+            )
+        )
+        target_gr_db = -overshoot * (1.0 - 1.0 / self.ratio)
+
+        # 밸리스틱 평활화 (수반 재귀)
+        gain_red_db = _OnePoleBallistics.apply(target_gr_db, self.a_att, self.a_rel)
+
+        # 게인 업샘플링 [n]
+        gain = torch.pow(10.0, gain_red_db / 20.0)
+        gain_up = torch.nn.functional.interpolate(
+            gain.view(1, 1, -1), size=x_pad.shape[-1], mode='linear', align_corners=False
+        ).view(-1)[:n]
+
+        # L과 R에 동일한 게인 곡선 적용 (Stereo Linked)
+        out = x_in * gain_up.unsqueeze(0)
+
+        # 최종 안전 하드 실링 클램프 (소프트니 오버슛 방어)
+        ceiling_lin = 10.0 ** (self.ceiling_db / 20.0)
+        out = torch.clamp(out, -ceiling_lin, ceiling_lin)
+
+        if orig_dim == 1:
+            out = out.squeeze(0)
+
+        if return_gr:
+            gr_np = gain_red_db.detach().cpu().numpy()
+            active = gr_np < -0.1
+            gr = {
+                "max_db": float(gr_np.min()) if gr_np.size > 0 else 0.0,
+                "mean_db": float(gr_np[active].mean()) if active.any() else 0.0,
+                "active": float(active.mean()) if active.size > 0 else 0.0,
+                "gr_tensor": gain_red_db,
+            }
+            if is_numpy:
+                return out.detach().cpu().numpy(), gr
+            return out, gr
+
+        if is_numpy:
+            return out.detach().cpu().numpy()
+        return out
+
+
 def compute_stft_crest_factor(stft_complex):
     """
     Computes Crest Factor (Peak to RMS ratio) in dB directly from STFT in a differentiable manner.
@@ -476,7 +603,7 @@ def _peak_rms_db(x, sr, win_sec=0.4, hop_sec=0.1):
 
 
 def mix_with_instrumental(vocal_path, inst_path, out_path, sr=44100,
-                          vocal_gain_db=0.0, vocal_offset_db=3.0,
+                          vocal_gain_db=0.0, vocal_offset_db=0.0,
                           inst_peak_db=-6.0, headroom_db=-1.0,
                           max_vocal_boost_db=24.0):
     """
@@ -486,7 +613,7 @@ def mix_with_instrumental(vocal_path, inst_path, out_path, sr=44100,
     - 반주는 inst_peak_db(기본 -6dBFS)로 피크 정규화해 기준 레벨(bed)을 잡는다.
     - **LUFS 기반 밸런스**: 보컬의 '가장 큰 구간 LUFS'를 반주의 '가장 큰 구간 LUFS'
       대비 (vocal_offset_db + vocal_gain_db) 만큼 위로 자동 정렬한다(ITU-R BS.1770 K-weighting).
-      기본 offset +3dB 로 슬라이더를 건드리지 않아도 보컬이 반주 위에 자연스럽게 얹힌다.
+      기본값 0.0dB 에서 보컬과 반주의 하이라이트 LUFS가 동일하게 맞춰진다.
       (peak/평균 RMS 매칭은 loudness를 정확히 반영 못해 보컬이 묻히는 문제가 있어 LUFS로 설계.)
     - 합산 후 피크가 헤드룸(기본 -1dBFS)을 넘으면 tanh 소프트 리미터로 클리핑 방지.
 
@@ -606,6 +733,25 @@ _GR_HARD_CAP_DB = 3.5    # 최종 리미터 게인 리덕션 절대 상한
 
 _MIN_MAKEUP_DB  = -12.0  # 메이크업 하한(감쇠 허용). GR 상한을 지키기 위해 필요
 
+# 마스터링 드라이브 게인 탐색(Adam). Adam 의 스텝 크기는 그래디언트 크기와 거의
+# 무관하게 lr 로 고정되므로, 도달 가능한 dB 범위 = steps × lr 이다.
+#
+# 이 파라미터는 dB 그 자체라 raw→dB 증폭이 없다(야코비안 1). EQ 의 θ 가 gain_scale_db
+# 배로, 컴프의 raw_threshold 가 60·σ(1-σ) 배로 증폭되는 것과 달리 lr 이 그대로
+# dB/step 이라, 다른 모듈과 같은 0.05 를 쓰면 같은 스텝수로 10배 이상 덜 움직인다.
+# 그래서 lr 은 0.05 로 통일하고 부족한 주행거리는 스텝으로 메운다. 이 루프는 3초
+# 하이라이트 구간에만 걸려 스텝당 1.25 ms 이므로(실측: 80→320 스텝에서 6.2s→6.5s)
+# 스텝을 늘리는 비용이 사실상 없다.
+#
+# 800 × 0.05 = 40 dB. 실제로 필요한 폭은 `target_boost - _MIN_MAKEUP_DB` 로 최대
+# 30 dB 남짓이라(레퍼런스보다 30 dB 조용한 믹스는 없다) 여유가 있다. 수렴 후에는
+# 제자리에 서 있을 뿐이라 스텝을 더 줘도 결과가 같다(1600 으로 검증, 값 동일).
+_DRIVE_STEPS = 800
+_DRIVE_LR    = 0.05
+# 소프트 페널티가 수렴하지 못한 경우를 위한 결정론적 하드 캡 가드.
+_DRIVE_GUARD_STEPS = 80
+_DRIVE_GUARD_DB    = 0.25
+
 
 def _brickwall_limiter(x, sr, ceiling=0.97, release_ms=80.0, win=256, return_gr=False):
     """
@@ -657,18 +803,22 @@ def _brickwall_limiter(x, sr, ceiling=0.97, release_ms=80.0, win=256, return_gr=
 
 
 def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
-                 match_amount=0.8, max_gain_db=8.0, ceiling_db=-0.3, eq_iters=300,
-                 max_gr_db=3.0):
+                 match_amount=1.0, gain_scale_db=8.0, ceiling_db=-0.3, eq_iters=300,
+                 max_gr_db=3.0, eq_l2=1.0, eq_smooth=1.0, lr_eq=0.05,
+                 limiter_ratio=50.0, limiter_attack_ms=0.1, limiter_release_ms=80.0,
+                 limiter_knee_db=1.0, max_gain_db=None):
     """
-    최종 풀믹스 마스터링: 레퍼런스 곡의 톤(EQ)을 따라가고 라우드니스를 맞춘 뒤 브릭월 리미터.
+    최종 풀믹스 마스터링: 레퍼런스 곡의 톤(EQ)을 따라가고 라우드니스를 맞춘 뒤 DifferentiableLimiter 로 피크 제한.
 
-    1) 풀밴드 DDSP EQ 로 풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭(보컬 매칭과 동일 원리,
-       단 저역 마스킹 없이 전대역·게인 한계 완화). match_amount 로 적용량 조절.
-    2) 레퍼런스의 활성 RMS(라우드니스)에 맞춰 메이크업 게인 적용.
-    3) -0.3 dBFS 브릭월 리미터로 피크 제한(빡세게 밀어붙인 뒤 클리핑 방지).
+    1) 풀밴드 DDSP EQ 로 풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭(hard_clamp=False, L2/스무딩 페널티 1.0).
+    2) 레퍼런스의 활성 RMS(최대 3초 LUFS)에 맞춰 볼륨(인풋 드라이브 게인) 계산.
+    3) DifferentiableLimiter(미분 가능한 스테레오 링크 리미터: ratio 50:1, attack 0.1ms, release 80ms, knee 1.0dB)로
+       천장(-0.3 dBFS)을 향해 볼륨을 밀어 올리면서 피크를 제어하고 클리핑을 방지.
 
     Returns: dict(정보)
     """
+    if max_gain_db is not None:
+        gain_scale_db = max_gain_db
     n_fft, hop, n_mels, eps = 2048, 512, 80, 1e-8
 
     mix, _ = librosa.load(mix_path, sr=sr, mono=False)
@@ -680,8 +830,15 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
     _, ref_mel, _ = compute_spectral_envelope(ref.mean(0), sr, n_fft, hop, n_mels)
 
     # --- Full-band EQ match (mix tone → reference tone) ---
-    eq = DifferentiableEQ(sample_rate=sr, n_fft=n_fft, num_bands=num_bands, max_gain_db=max_gain_db)
-    opt = optim.Adam(eq.parameters(), lr=0.15)
+    # hard_clamp=False: 믹싱과 동일하게 벽(tanh)을 없애고 선형 개방.
+    # 대신 eq_l2=1.0, eq_smooth=1.0 페널티로 매우 미세하고 완만하게만 작동하게 제한.
+    eq = DifferentiableEQ(sample_rate=sr, n_fft=n_fft, num_bands=num_bands, gain_scale_db=gain_scale_db, hard_clamp=False)
+    # lr 은 raw 파라미터 θ 의 스텝이고, 실제로 움직이는 양은 gain_scale_db 를 곱한
+    # dB 다(= lr × gain_scale_db). 믹싱 EQ(`pipeline.match_e2e` 의 lr_eq)와 같은 값을
+    # 쓰되 여기 gain_scale_db 가 8(믹싱 15)이라, dB 로 환산하면 0.4 dB/step 으로
+    # 믹싱의 0.75 dB/step 보다 미세하다 — 마스터링 쪽이 더 정밀해야 하므로 의도한 방향.
+    # 스텝 예산은 eq_iters=300 이라 도달 범위 120 dB, 필요량 대비 과잉이다.
+    opt = optim.Adam(eq.parameters(), lr=lr_eq)
     mix_power = torch.mean(mix_mag ** 2, dim=1)
     ref_mel_norm = ref_mel / (torch.sum(ref_mel) + eps)
     ref_mel_db = 10.0 * torch.log10(ref_mel_norm + eps)
@@ -693,7 +850,14 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         filt_mel = torch.matmul(mel_fb, filt_power)
         filt_mel_norm = filt_mel / (torch.sum(filt_mel) + eps)
         filt_mel_db = 10.0 * torch.log10(filt_mel_norm + eps)
-        loss = torch.mean((filt_mel_db - ref_mel_db) ** 2) + 0.01 * torch.mean(torch.diff(gains) ** 2)
+
+        # 톤 매칭 MSE + L2 게인 크기 페널티 (eq_l2=1.0) + 인접 밴드 급변 억제 페널티 (eq_smooth=1.0)
+        loss = torch.mean((filt_mel_db - ref_mel_db) ** 2)
+        if eq_l2 > 0.0:
+            loss = loss + eq_l2 * torch.mean(gains ** 2)
+        if eq_smooth > 0.0 and gains.numel() > 1:
+            loss = loss + eq_smooth * torch.mean(torch.diff(gains) ** 2)
+
         loss.backward()
         opt.step()
 
@@ -702,15 +866,6 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         applied_curve_db = (curve_db * match_amount).numpy()
 
         # --- 레벨 중립화 ---
-        # EQ 는 톤 밸런스만 바꿔야 하고 전체 음량은 건드리면 안 된다. 그러지 않으면
-        # EQ 부스트가 라우드니스를 올려버려 뒤따르는 메이크업 게인이 할 일이 없어지고
-        # (실측: 필요 makeup 4.25 dB 가 0 으로 계산됨), 결과적으로 라우드니스 매칭을
-        # 톤 매칭 단계가 대신 하게 된다. 그 부스트가 프레즌스에 몰리면 쏘는 소리가 된다.
-        #
-        # 곡선 g(f) 를 걸었을 때의 총 파워 변화는 믹스의 평균 파워 스펙트럼 P(f) 로
-        # 정확히 계산된다:  ΔdB = 10·log10( Σ g²P / Σ P ).
-        # 이 값을 곡선 전체에서 빼면 총 파워 변화가 0 이 된다. 곡선 모양은 그대로고
-        # 세로 위치만 이동하므로 톤 매칭 결과는 보존된다.
         g_lin = np.power(10.0, applied_curve_db / 20.0)
         P = mix_power.numpy()
         delta_db = 10.0 * np.log10(
@@ -734,46 +889,75 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         out[ch] = librosa.istft(S, hop_length=hop, length=mix.shape[1])
 
     # --- Loudness match to reference (LUFS, ITU-R BS.1770 K-weighting) ---
-    # 가장 큰 구간의 LUFS를 라우드니스 지표로 사용. 전체 평균은 레퍼런스의 무음/조용한 구간에
-    # 휘둘려 마스터가 부당하게 작아지므로, 후렴 등 가장 큰 대목의 LUFS끼리 정렬한다.
     ref_lufs = _loudest_lufs(ref, sr, win_sec=3.0)
     out_lufs = _loudest_lufs(out, sr, win_sec=3.0)
-    # 믹스가 레퍼런스보다 조용하면 키우고, 이미 더 크면 줄이지 않는다(마스터가 더 작아지지 않게).
     makeup_requested = max(0.0, ref_lufs - out_lufs)
 
-    # --- Loudness vs. 리미터 부담의 타협 ---
-    # 레퍼런스 LUFS 를 무조건 따라가면 초과분을 전부 브릭월 리미터가 흡수한다.
-    # 상용 마스터는 컴프·새추레이션·멀티밴드를 거쳐 그 라우드니스에 도달하는데,
-    # 여기서는 리미터 하나가 그 일을 다 하게 되어 뭉개진(우악스러운) 소리가 된다.
-    #
-    # 리미터의 게인 리덕션을 직접 재서 예산(max_gr_db)을 넘으면 그만큼 메이크업을
-    # 되돌린다. 라우드니스를 조금 포기하고 다이내믹을 지키는 쪽을 택한다.
-    ceiling = 10.0 ** (ceiling_db / 20.0)
-    pre_makeup = out  # 메이크업 적용 전 신호 (반복 시 기준으로 재사용)
-    makeup_db = makeup_requested
+    # --- DifferentiableLimiter 기반 미분 가능 안전 볼륨 최적화 (Adam) ---
+    # 목표 부스트(target_boost_db)에서 시작해 lr=_DRIVE_LR(0.05)로 내려오면서,
+    # 목표 LUFS와 리미터 3.0 dB 상한선 페널티 사이의 스윗스팟을 부드럽게 탐색
+    limiter = DifferentiableLimiter(
+        sample_rate=sr,
+        ceiling_db=ceiling_db,
+        ratio=limiter_ratio,
+        attack_ms=limiter_attack_ms,
+        release_ms=limiter_release_ms,
+        knee_db=limiter_knee_db,
+    )
 
-    def _apply(mk):
-        return _brickwall_limiter(
-            pre_makeup * (10.0 ** (mk / 20.0)), sr, ceiling=ceiling, return_gr=True
-        )
+    pre_makeup_tensor = torch.from_numpy(out).float()
 
-    # 목표는 max_gr_db(기본 3.0 dB). 초과분만큼 메이크업을 되돌리며 수렴시킨다.
-    out, gr = _apply(makeup_db)
-    for _ in range(12):
-        over = (-gr["max_db"]) - max_gr_db
-        if over <= 0.05 or makeup_db <= _MIN_MAKEUP_DB:
-            break
-        # 음수(감쇠)까지 허용한다. 믹스 자체 피크가 이미 실링을 넘는 경우
-        # 메이크업 0 으로도 GR 상한을 못 지키기 때문이다(실측 -8.13 dB).
-        makeup_db = max(_MIN_MAKEUP_DB, makeup_db - over)
-        out, gr = _apply(makeup_db)
+    # 속도와 정확도를 위해 가장 에너지가 큰 하이라이트 3초 구간을 기준으로 학습
+    start_samp, end_samp, _ = loudest_window(out, sr, win_sec=3.0, hop_sec=1.0)
+    eval_slice = pre_makeup_tensor[:, start_samp:end_samp]
 
-    # 하드 캡: 위에서 수렴하지 못했더라도 GR 이 3.5 dB 를 넘기지 않게 강제로 더 깎는다.
-    guard = 0
-    while (-gr["max_db"]) > _GR_HARD_CAP_DB and makeup_db > _MIN_MAKEUP_DB and guard < 40:
-        makeup_db = max(_MIN_MAKEUP_DB, makeup_db - 0.25)
-        out, gr = _apply(makeup_db)
-        guard += 1
+    target_boost_db = float(makeup_requested)
+
+    # 초기값 = 목표 부스트. 0 에서 시작하면 Adam 의 스텝 크기가 대략 lr 로 고정돼
+    # (n_steps × lr) dB 이상은 절대 못 올라간다 — 목표가 그보다 크면 라우드니스가
+    # 조용한 쪽으로 잘린 채 끝난다. 목표에서 시작하고 GR 페널티가 필요한 만큼만
+    # 되돌리게 하면(예전 makeup 되감기 루프와 같은 방향) 그 절단이 사라진다.
+    drive_gain = nn.Parameter(torch.full((1,), target_boost_db))
+    drive_opt = optim.Adam([drive_gain], lr=_DRIVE_LR)
+
+    for step in range(_DRIVE_STEPS):
+        drive_opt.zero_grad()
+        out_eval, gr_eval = limiter(eval_slice, input_gain_db=drive_gain, return_gr=True)
+
+        # 1. 볼륨 손실: 목표치(target_boost_db)에 도달할 때까지 밀어올림
+        loss_vol = torch.relu(target_boost_db - drive_gain) ** 2
+
+        # 2. 리미터 3.0 dB 상한선 페널티: 리덕션이 max_gr_db(3.0 dB)를 넘으면 강력한 브레이크
+        max_gr_tensor = -torch.min(gr_eval["gr_tensor"])
+        loss_gr = torch.relu(max_gr_tensor - max_gr_db) ** 2 * 25.0
+
+        loss = loss_vol + loss_gr
+        loss.backward()
+        drive_opt.step()
+
+        # 믹스 자체 피크가 이미 실링을 넘는 경우 감쇠까지 내려가야 GR 상한을 지킬 수
+        # 있다. 다만 무한정 내려가지는 않게 하한을 둔다.
+        with torch.no_grad():
+            drive_gain.clamp_(min=_MIN_MAKEUP_DB, max=max(target_boost_db, 0.0))
+
+    # --- 하드 캡 가드 ---
+    # 위 최적화는 GR 예산을 '부드러운' 페널티로만 다룬다. 충분히 수렴하지 못했거나
+    # 볼륨 손실과 균형을 이룬 지점이 예산 위라면 GR 이 3.0 dB 를 넘긴 채로 끝난다.
+    # 그 상태의 마스터는 리미터 하나가 다이내믹을 전부 흡수한 뭉갠 소리가 되므로,
+    # _GR_HARD_CAP_DB 를 넘지 않을 때까지 결정론적으로 더 깎는다.
+    with torch.no_grad():
+        for _ in range(_DRIVE_GUARD_STEPS):
+            _, gr_guard = limiter(eval_slice, input_gain_db=float(drive_gain.item()), return_gr=True)
+            if (-gr_guard["max_db"]) <= _GR_HARD_CAP_DB or float(drive_gain.item()) <= _MIN_MAKEUP_DB:
+                break
+            drive_gain.sub_(_DRIVE_GUARD_DB).clamp_(min=_MIN_MAKEUP_DB)
+
+    with torch.no_grad():
+        final_drive_db = float(drive_gain.item())
+        # 곡 전체에 최적화된 마스터링 드라이브 적용
+        out_tensor, gr = limiter(pre_makeup_tensor, input_gain_db=final_drive_db, return_gr=True)
+        out = out_tensor.detach().cpu().numpy()
+        makeup_db = final_drive_db
 
     sf.write(out_path, out.T, sr)
 

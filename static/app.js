@@ -14,6 +14,7 @@ let isSeeking = false;
 const audioRaw = document.getElementById('audio-raw');
 const audioProcessed = document.getElementById('audio-processed');
 const audioRef = document.getElementById('audio-ref');
+const audioRefSong = document.getElementById('audio-ref-song');
 const audioFullmix = document.getElementById('audio-fullmix');
 const audioFullmixRaw = document.getElementById('audio-fullmix-raw');
 const audioMastered = document.getElementById('audio-mastered');
@@ -62,6 +63,7 @@ const masterVolume = document.getElementById('master-volume');
 const modeBtnRaw = document.getElementById('mode-raw');
 const modeBtnProcessed = document.getElementById('mode-processed');
 const modeBtnRef = document.getElementById('mode-ref');
+const modeBtnRefSong = document.getElementById('mode-ref-song');
 const modeBtnFullmix = document.getElementById('mode-fullmix');
 const modeBtnFullmixRaw = document.getElementById('mode-fullmix-raw');
 const modeBtnMastered = document.getElementById('mode-mastered');
@@ -187,6 +189,7 @@ function stopAllAudio() {
     audioRaw.pause();
     audioProcessed.pause();
     audioRef.pause();
+    if (audioRefSong) audioRefSong.pause();
     audioFullmix.pause();
     audioFullmixRaw.pause();
     audioMastered.pause();
@@ -212,14 +215,20 @@ function switchMode(newMode) {
     
     activeMode = newMode;
 
-    // Select new active audio + sync button highlight (4 modes)
-    const audioMap = { raw: audioRaw, processed: audioProcessed, ref: audioRef, fullmix: audioFullmix, fullmixraw: audioFullmixRaw, mastered: audioMastered };
-    const btnMap = { raw: modeBtnRaw, processed: modeBtnProcessed, ref: modeBtnRef, fullmix: modeBtnFullmix, fullmixraw: modeBtnFullmixRaw, mastered: modeBtnMastered };
+    // Select new active audio + sync button highlight (modes: raw, processed, ref, refsong, fullmix, fullmixraw, mastered)
+    const audioMap = { raw: audioRaw, processed: audioProcessed, ref: audioRef, refsong: audioRefSong, fullmix: audioFullmix, fullmixraw: audioFullmixRaw, mastered: audioMastered };
+    const btnMap = { raw: modeBtnRaw, processed: modeBtnProcessed, ref: modeBtnRef, refsong: modeBtnRefSong, fullmix: modeBtnFullmix, fullmixraw: modeBtnFullmixRaw, mastered: modeBtnMastered };
     currentAudio = audioMap[activeMode] || audioProcessed;
-    Object.keys(btnMap).forEach((m) => btnMap[m].classList.toggle('active', m === activeMode));
+    Object.keys(btnMap).forEach((m) => {
+        if (btnMap[m]) btnMap[m].classList.toggle('active', m === activeMode);
+    });
 
-    // Synchronize play parameters
-    currentAudio.currentTime = currentTime;
+    // Synchronize play parameters (clamped to duration)
+    if (!isNaN(currentAudio.duration) && currentTime > currentAudio.duration) {
+        currentAudio.currentTime = 0;
+    } else {
+        currentAudio.currentTime = currentTime;
+    }
     currentAudio.volume = masterVolume.value;
     
     if (wasPlaying) {
@@ -260,6 +269,7 @@ function handleTimeUpdate(e) {
 audioRaw.addEventListener('timeupdate', handleTimeUpdate);
 audioProcessed.addEventListener('timeupdate', handleTimeUpdate);
 audioRef.addEventListener('timeupdate', handleTimeUpdate);
+if (audioRefSong) audioRefSong.addEventListener('timeupdate', handleTimeUpdate);
 audioFullmix.addEventListener('timeupdate', handleTimeUpdate);
 audioFullmixRaw.addEventListener('timeupdate', handleTimeUpdate);
 audioMastered.addEventListener('timeupdate', handleTimeUpdate);
@@ -274,6 +284,7 @@ function handleMetadataLoad(e) {
 audioRaw.addEventListener('loadedmetadata', handleMetadataLoad);
 audioProcessed.addEventListener('loadedmetadata', handleMetadataLoad);
 audioRef.addEventListener('loadedmetadata', handleMetadataLoad);
+if (audioRefSong) audioRefSong.addEventListener('loadedmetadata', handleMetadataLoad);
 audioFullmix.addEventListener('loadedmetadata', handleMetadataLoad);
 audioFullmixRaw.addEventListener('loadedmetadata', handleMetadataLoad);
 audioMastered.addEventListener('loadedmetadata', handleMetadataLoad);
@@ -288,6 +299,7 @@ function handleAudioEnded(e) {
 audioRaw.addEventListener('ended', handleAudioEnded);
 audioProcessed.addEventListener('ended', handleAudioEnded);
 audioRef.addEventListener('ended', handleAudioEnded);
+if (audioRefSong) audioRefSong.addEventListener('ended', handleAudioEnded);
 audioFullmix.addEventListener('ended', handleAudioEnded);
 audioFullmixRaw.addEventListener('ended', handleAudioEnded);
 audioMastered.addEventListener('ended', handleAudioEnded);
@@ -305,6 +317,7 @@ globalSeek.addEventListener('change', () => {
     audioRaw.currentTime = seekVal;
     audioProcessed.currentTime = seekVal;
     audioRef.currentTime = seekVal;
+    if (audioRefSong) audioRefSong.currentTime = seekVal;
     audioFullmix.currentTime = seekVal;
     audioFullmixRaw.currentTime = seekVal;
     audioMastered.currentTime = seekVal;
@@ -318,6 +331,7 @@ masterVolume.addEventListener('input', (e) => {
     audioRaw.volume = vol;
     audioProcessed.volume = vol;
     audioRef.volume = vol;
+    if (audioRefSong) audioRefSong.volume = vol;
     audioFullmix.volume = vol;
     audioFullmixRaw.volume = vol;
     audioMastered.volume = vol;
@@ -327,6 +341,7 @@ masterVolume.addEventListener('input', (e) => {
 modeBtnRaw.addEventListener('click', () => switchMode('raw'));
 modeBtnProcessed.addEventListener('click', () => switchMode('processed'));
 modeBtnRef.addEventListener('click', () => switchMode('ref'));
+if (modeBtnRefSong) modeBtnRefSong.addEventListener('click', () => switchMode('refsong'));
 modeBtnFullmix.addEventListener('click', () => switchMode('fullmix'));
 modeBtnFullmixRaw.addEventListener('click', () => switchMode('fullmixraw'));
 modeBtnMastered.addEventListener('click', () => switchMode('mastered'));
@@ -434,6 +449,25 @@ processBtn.addEventListener('click', async () => {
             modeBtnMastered.setAttribute('disabled', 'true');
         }
 
+        // Reference Song (레퍼런스 원곡 완곡)
+        if (data.audio_urls && data.audio_urls.ref_song && audioRefSong && modeBtnRefSong) {
+            audioRefSong.src = data.audio_urls.ref_song;
+            audioRefSong.load();
+            modeBtnRefSong.style.display = '';
+            modeBtnRefSong.removeAttribute('disabled');
+        } else if (modeBtnRefSong) {
+            modeBtnRefSong.style.display = 'none';
+            modeBtnRefSong.setAttribute('disabled', 'true');
+        }
+
+        if (data.separated_ref) {
+            modeBtnRef.textContent = '레퍼런스 보컬';
+            if (modeBtnRefSong) modeBtnRefSong.textContent = '💿 레퍼런스 곡 전체';
+        } else {
+            modeBtnRef.textContent = '레퍼런스 보컬/음원';
+            if (modeBtnRefSong) modeBtnRefSong.textContent = '💿 레퍼런스 곡 전체';
+        }
+
         // Enable Players Controls — 기본 재생 대상: 마스터 > 풀믹스 > 처리보컬
         const defaultMode = hasMastered ? 'mastered' : (hasFullMix ? 'fullmix' : 'processed');
         const defaultAudioMap = { mastered: audioMastered, fullmix: audioFullmix, processed: audioProcessed };
@@ -446,8 +480,8 @@ processBtn.addEventListener('click', async () => {
         masterPlayBtn.removeAttribute('disabled');
         globalSeek.removeAttribute('disabled');
 
-        [modeBtnRaw, modeBtnProcessed, modeBtnRef, modeBtnFullmix, modeBtnFullmixRaw, modeBtnMastered]
-            .forEach((b) => b.classList.remove('active'));
+        [modeBtnRaw, modeBtnProcessed, modeBtnRef, modeBtnRefSong, modeBtnFullmix, modeBtnFullmixRaw, modeBtnMastered]
+            .forEach((b) => { if (b) b.classList.remove('active'); });
         ({ mastered: modeBtnMastered, fullmix: modeBtnFullmix, processed: modeBtnProcessed })[defaultMode].classList.add('active');
 
         // Update download button — 마스터 > 풀믹스 > 처리보컬 순으로 다운로드 우선

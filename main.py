@@ -49,8 +49,8 @@ async def api_match_eq(
     #   eq_smooth: mean(diff(g)^2) 페널티. 크면 인접 밴드 간 요철이 줄어 커브가 매끈해진다.
     eq_l2: float = Form(0.1),
     eq_smooth: float = Form(0.1),
-    # 컴프 ratio. 학습하지 않는 설정값(1=무압축, 3=보컬 표준, 큰 값=리미터).
-    comp_ratio: float = Form(3.0),
+    # 컴프 ratio. 학습하지 않는 설정값(1=무압축, 10=기본값, 큰 값=리미터).
+    comp_ratio: float = Form(10.0),
     # 컴프 threshold 가 신호 아래로 내려가는 것을 막는 정규화 가중치. 0이면 비활성.
     comp_thresh_weight: float = Form(0.0),
     match_amount: float = Form(1.0),
@@ -61,7 +61,7 @@ async def api_match_eq(
     instrumental: UploadFile = File(None),
     vocal_gain_db: float = Form(0.0),
     separate_ref: bool = Form(False),
-    master: bool = Form(False),
+    master: bool = Form(True),
     e2e_steps: int = Form(50),
     # 잔향(IR)을 어디서 측정할지: "instrumental"(반주, 기본) 또는 "reference"(레퍼런스 보컬)
     ir_source: str = Form("instrumental"),
@@ -146,7 +146,7 @@ async def api_match_eq(
                 comp_thresh_weight=comp_thresh_weight,
                 match_amount=match_amount,
                 match_volume=match_volume,
-                max_gain_db=15.0,
+                gain_scale_db=15.0,
                 comp_amount=comp_amount,
                 reverb_amount=reverb_amount,
                 mode=mode,
@@ -237,10 +237,9 @@ async def api_match_eq(
         audio_urls = {
             "raw": raw_url,
             "ref": ref_url,
-            "processed": output_url
+            "processed": output_url,
+            "ref_song": f"/data/uploads/{ref_filename}"
         }
-        if separate_ref and ref_extracted_path:
-            audio_urls["ref_song"] = f"/data/uploads/{ref_filename}"
         if has_instrumental:
             audio_urls["instrumental"] = f"/data/uploads/{inst_filename}"
             audio_urls["full_mix"] = f"/data/outputs/fullmix_{session_id}.wav"

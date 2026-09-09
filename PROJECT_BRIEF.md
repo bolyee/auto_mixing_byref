@@ -102,7 +102,7 @@ raw_vocal: File          ref_vocal: File          instrumental: File (optional)
 num_bands: int = 5       match_amount: float = 1.0    smoothness: float = 1.0
 hpf_freq: float = 80.0   lpf_freq: float = 16000.0    match_volume: bool = False
 comp_amount: float = 1.0 reverb_amount: float = 1.0   mode: str = "both"
-vocal_gain_db: float=0.0 separate_ref: bool = False   master: bool = False
+vocal_gain_db: float=0.0 separate_ref: bool = False   master: bool = True
 ```
 - 허용 확장자: `.wav .mp3 .flac .ogg .m4a`
 - `hpf_freq <= 20` → `None`, `lpf_freq >= 20000` → `None` 으로 변환 후 전달

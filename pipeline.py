@@ -143,10 +143,10 @@ LOSS_MEASURE_POINT: str = "post_reverb"
 # 컴프 ratio. **학습하지 않는 설정 상수**다(§7 — 학습시키면 R→1 에서 그래디언트가
 # 소멸해 bypass 가 흡인점이 되고, threshold 와 축퇴가 생긴다). 학습 대상은 threshold
 # 하나뿐이라는 구조는 그대로 두고, 값만 곡·상황에 맞게 고를 수 있게 열어 둔다.
-#   1.0        = bypass (압축 없음)
-#   3.0 (기본) = 보컬 표준
-#   1000       = 사실상 리미터 (상한, `DifferentiableCompressor.RATIO_MAX`)
-COMP_RATIO: float = 3.0
+#   1.0         = bypass (압축 없음)
+#   10.0 (기본) = 적극적인 압축
+#   1000        = 사실상 리미터 (상한, `DifferentiableCompressor.RATIO_MAX`)
+COMP_RATIO: float = 10.0
 
 
 # --------------------------------------------------------------------------- #
@@ -596,15 +596,20 @@ class E2EChain(nn.Module):
         n_fft: int = N_FFT,
         hop_length: int = HOP_LENGTH,
         num_bands: int = VOCAL_EQ_BANDS,
-        max_gain_db: float = 15.0,
+        gain_scale_db: float = 15.0,
         reverb_seconds: float = 1.5,
         reverb_wet_max: float = 0.7,
         attack_ms: float = 0.5,
         release_ms: float = 120.0,
         comp_ratio: float = COMP_RATIO,
         active_modes: Optional[List[str]] = None,
+        max_gain_db: Optional[float] = None,
     ) -> None:
         super().__init__()
+        if max_gain_db is not None:
+            gain_scale_db = max_gain_db
+        self.gain_scale_db = gain_scale_db
+        self.max_gain_db = gain_scale_db
         self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.hop_length = hop_length
@@ -619,7 +624,7 @@ class E2EChain(nn.Module):
         self.eq = DifferentiableEQ(
             sample_rate=sample_rate, n_fft=n_fft, num_bands=num_bands,
             min_freq=VOCAL_EQ_MIN_FREQ, max_freq=VOCAL_EQ_MAX_FREQ,
-            max_gain_db=max_gain_db, hard_clamp=False,
+            gain_scale_db=gain_scale_db, hard_clamp=False,
         )
         self.comp = DifferentiableCompressor(
             sample_rate=sample_rate,
@@ -814,7 +819,7 @@ def match_e2e(
     num_bands: int = VOCAL_EQ_BANDS,
     match_amount: float = 1.0,
     match_volume: bool = False,
-    max_gain_db: float = 15.0,
+    gain_scale_db: float = 15.0,
     comp_amount: float = 1.0,
     reverb_amount: float = 1.0,
     mode: str = "both",
@@ -824,12 +829,13 @@ def match_e2e(
     release_ms: float = 120.0,
     comp_ratio: float = COMP_RATIO,
     lr_eq: float = 0.05,
-    lr_comp: float = 0.02,
+    lr_comp: float = 0.05,
     lr_reverb: float = 0.05,
     eq_l2: float = 0.1,
     eq_smooth: float = 0.1,
     comp_thresh_weight: float = 0.0,
     verbose: bool = True,
+    max_gain_db: Optional[float] = None,
 ) -> Dict:
     """EQ / Comp / Reverb 를 최적화하고 결과를 렌더링해 저장한다.
 
@@ -877,6 +883,9 @@ def match_e2e(
               f"ref {r_train.shape[0]/TARGET_SR:.1f}s")
 
     # ---------------- 체인 ----------------
+    if max_gain_db is not None:
+        gain_scale_db = max_gain_db
+
     manual_reverb = reverb_mode == "manual"
     if manual_reverb:
         # 수동 모드에서는 wet 노브가 곧 사용자 값이므로 렌더 단계의 재블렌드
@@ -891,7 +900,7 @@ def match_e2e(
         n_fft=N_FFT,
         hop_length=HOP_LENGTH,
         num_bands=num_bands,
-        max_gain_db=max_gain_db,
+        gain_scale_db=gain_scale_db,
         attack_ms=attack_ms,
         release_ms=release_ms,
         comp_ratio=comp_ratio,
@@ -1186,7 +1195,7 @@ def match_e2e(
                 )
                 d.update(d_tone)
 
-                # 하드 클램프(tanh ±max_gain_db)는 상한에 닿기 전까지 저항이 0 이라, 결국
+                # 하드 클램프(tanh ±gain_scale_db)는 상한에 닿기 전까지 저항이 0 이라, 결국
                 # "일단 크게 밀고 벽에서 잘리는" 사후 절단과 다를 바 없어진다. 제곱 페널티는
                 # 게인이 커질수록 한계비용이 커져서(1 dB 밀 때 비용이 1 dB 지점 대비 14 dB
                 # 지점에서 약 10 배), 작은 보정은 거의 공짜로 두고 큰 부스트만 억제한다.

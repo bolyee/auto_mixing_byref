@@ -73,7 +73,7 @@ DDSP Vocal Auto-Mix
 | 컴프 | $K$ | 4 dB (soft knee) | `DifferentiableCompressor(knee_db=)` |
 | 컴프 | $H_d, W_d$ | 128, 256 samples | `DifferentiableCompressor(detector_hop=)` |
 | 컴프 | $\tau_a,\tau_r$ | 0.5 ms, 120 ms | `pipeline.match_e2e(attack_ms=, release_ms=)` |
-| 컴프 | $R$ | **설정 가능 상수 (기본 3.0 : 1), 학습 안 함** | `pipeline.COMP_RATIO` |
+| 컴프 | $R$ | **설정 가능 상수 (기본 10.0 : 1), 학습 안 함** | `pipeline.COMP_RATIO` |
 | 컴프 초기값 | $T_0$ | $-30$ dB | `modules.py` |
 
 ---
@@ -82,7 +82,7 @@ DDSP Vocal Auto-Mix
 |---|---|---|---|
 | 정규화 | $\lambda_2,\lambda_s$ | 0.1, 0.1 | `main.py` |
 | 정규화 | $w_t$ | 0.0 (threshold 심도) | `main.py` |
-| 학습 | lr | EQ 0.05 / Comp 0.02, $n=50$ | `pipeline.match_e2e(lr_eq=, lr_comp=, n_steps=)` |
+| 학습 | lr | EQ / Comp / Reverb 모두 0.05, $n=50$ | `pipeline.match_e2e(lr_eq=, lr_comp=, lr_reverb=, n_steps=)` |
 | 학습 | 그래디언트 경로 | `"selective"` | `pipeline.LOSS_GRAD_MODE` (§11) |
 | 학습 | 손실 측정 지점 | `"post_reverb"` (리버브 뒤) | `pipeline.LOSS_MEASURE_POINT` |
 
@@ -312,7 +312,7 @@ l_dyn.backward()     # θ_T 에만 누적
 optimizer.step()     # 단일 Adam, param group 으로 lr 분리
 ```
 
-$$\text{Adam},\quad \eta_{\text{EQ}}=0.05\ (\theta),\qquad \eta_{\text{comp}}=0.02\ (\theta_T),\qquad n_{\text{steps}}=50$$
+$$\text{Adam},\quad \eta_{\text{EQ}}=\eta_{\text{comp}}=\eta_{\text{reverb}}=0.05,\qquad n_{\text{steps}}=50$$
 
 
 
@@ -605,7 +605,7 @@ $$
 
 **측정 시점**: 세 손실의 원시값($L_{\text{tone}}, L_{\text{dyn}}, L_{\text{decay}}$)은 학습 궤적이 아니라 **최종 렌더 출력에서 1회** 계산한다(`DSPMatchingLoss.report`). 학습 루프가 계산하지 않은 항도 여기서는 값이 나온다.
 
-**컴프 파라미터 표시**: $R$ 은 항상 $3.0$ 으로 고정 표시되고, 학습 결과로 움직이는 것은 $T$ 와 $\text{GR}_{\max}$ 뿐이다.
+**컴프 파라미터 표시**: $R$ 은 설정값(기본 $10.0$)으로 고정 표시되고, 학습 결과로 움직이는 것은 $T$ 와 $\text{GR}_{\max}$ 뿐이다.
 
 **렌더 후처리** (손실이 보지 못하는 연산):
 
@@ -613,6 +613,163 @@ $$
 - 소프트 리미터: 피크 $>0.88$ 일 때 $\lvert y\rvert>0.85$ 인 표본에만
 $$\hat y=\operatorname{sign}(y)\Big[0.85+0.11\tanh\frac{\lvert y\rvert-0.85}{0.11}\Big]$$
 
+---
+
+# Part II. 마스터링 체인 (`modules.py:master_track`)
+
+## 믹스 버스에서 최종 출력까지의 수학적 신호 흐름
+
+* **보컬 체인 (Part I)**: 보컬 모노 트랙의 톤·다이내믹을 레퍼런스 보컬에 정밀 최적화
+* **마스터링 체인 (Part II)**: 풀믹스(2채널)의 톤(EQ)을 레퍼런스 곡에 맞추고, 라우드니스를 정렬한 뒤 브릭월 리미터로 피크를 제한하는 결정론적 DSP 체인
+
+---
+
+## 18. 마스터링 체인 — 전체 신호 흐름도
+
+현재 `modules.py:master_track` 의 실제 동작 파이프라인:
+
+```
+풀믹스 x[n] (2-ch, 44.1 kHz), 레퍼런스 r[n]
+  │
+  ├─► [1. 모노 다운믹스 & 멜 스펙트럼 분석] ──► P_mix(f), ref_mel_db 계산
+  │
+  ├─► [2. 풀밴드 DDSP EQ 최적화] ──► 15-band Adam (lr=0.05, 300 steps)
+  │
+  ├─► [3. 파워 보존 레벨 중립화] ──► ΔdB 계산 후 곡선 전체 오프셋 차감 (음량 불변)
+  │
+  ├─► [4. STFT 채널별 필터링 & iSTFT] ──► 2채널 스테레오 신호 out[ch, n] 복원
+  │
+  ├─► [5. 최대 라우드니스 구간 탐색] ──► _loudest_lufs (3초 창 슬라이딩)
+  │
+  ├─► [6. 라우드니스 vs 리미터 GR 예산 타협 루프] ──► 목표 GR 3.0 dB, 하드캡 3.5 dB
+  │
+  └─► [7. 블록 기반 지수 릴리즈 브릭월 리미터] ──► _brickwall_limiter (win=256, τ_r=80ms)
+```
+
+---
+
+## 19. 마스터 EQ — 멜 스펙트럼 매칭과 파워 보존 중립화
+
+**모노 다운믹스 및 파워 스펙트럼**:
+
+$$\bar{x}[n] = \frac{x_L[n] + x_R[n]}{2}, \qquad P_{\text{mix}}(f) = \frac{1}{T} \sum_t |S_{\bar{x}}(f, t)|^2$$
+
+$$\tilde{M}_{\text{ref}}(m) = 10 \log_{10}\left( \frac{(\Psi P_{\text{ref}})_m}{\sum_k (\Psi P_{\text{ref}})_k + \epsilon} + \epsilon \right) \qquad (m = 1, \dots, 80)$$
+
+**최적화 목적함수** (15밴드 가우시안 곡선 $G(f; \theta)$, `hard_clamp=False`, 저역 마스크 없음):
+
+$$\mathcal{L}_{\text{master\_eq}} = \frac{1}{80} \sum_{m=1}^{80} \Big( \tilde{M}_{\text{filt}}(m) - \tilde{M}_{\text{ref}}(m) \Big)^2 + \underbrace{1.0 \cdot \frac{1}{15} \sum_{j=1}^{15} \gamma_j^2}_{\lambda_2 = 1.0\ (\text{게인 크기 억제})} + \underbrace{1.0 \cdot \frac{1}{14} \sum_{j=1}^{14} (\gamma_{j+1} - \gamma_j)^2}_{\lambda_s = 1.0\ (\text{완만한 곡선 유도})}$$
+
+* **믹싱($0.1, 0.1$) 대비 $1.0, 1.0$ 적용 이유**: 마스터링은 트랙 전체의 밸런스를 살짝만 보정해야 하므로, 페널티를 10배 강하게 걸어 과도한 부스트/컷이나 급격한 요동을 완전히 억제하고 **극도로 절제된 곡선**만 허용한다.
+
+$$P_{\text{filt}}(f) = P_{\text{mix}}(f) \cdot 10^{G(f; \theta)/10}, \qquad \tilde{M}_{\text{filt}} = \text{mel\_norm\_db}(\Psi P_{\text{filt}})$$
+
+$$\text{Adam}(\theta), \quad \eta = 0.05, \quad n_{\text{iters}} = 300$$
+
+---
+
+## 19-B. EQ 레벨 중립화 (Level Neutralization)
+
+**문제**: EQ 부스트가 라우드니스를 올려버리면 뒤따르는 메이크업 게인이 0이 되어, 톤 매칭 단계가 음량 매칭을 대신하게 된다(프레즌스 부스트 시 쏘는 소리 유발).
+
+**해결 (파워 보존 오프셋)**: 매칭 강도 $\alpha = 0.8$ 적용 곡선 $G_{\text{applied}}(f) = \alpha \cdot G(f)$ 에 대해,
+
+$$\Delta_{\text{power}} = 10 \log_{10} \left( \frac{\sum_f 10^{G_{\text{applied}}(f)/10} \cdot P_{\text{mix}}(f)}{\sum_f P_{\text{mix}}(f) + \epsilon} + \epsilon \right) \quad (\text{dB})$$
+
+$$G_{\text{neutral}}(f) = G_{\text{applied}}(f) - \Delta_{\text{power}}$$
+
+$$\Longrightarrow \quad \sum_f 10^{G_{\text{neutral}}(f)/10} \cdot P_{\text{mix}}(f) \equiv \sum_f P_{\text{mix}}(f)$$
+
+곡선 전체 세로 위치만 이동하므로 **톤 매칭 형상은 그대로 보존**되고, EQ로 인한 **총 파워 변화량은 정확히 $0\ \text{dB}$** 가 된다.
+
+---
+
+## 20. 라우드니스 매칭 — 최대 구간 탐색 (`_loudest_lufs`)
+
+**왜 곡 전체 평균이 아닌가**: 곡 전체 평균 LUFS 를 쓰면 레퍼런스의 조용한 인트로/아웃트로에 휘둘려 마스터가 부당하게 작아진다. 따라서 후렴구 등 **가장 에너지가 큰 대목끼리 정렬**한다.
+
+**슬라이딩 윈도우 알고리즘** (`win_sec = 3.0`, `hop_sec = 1.0`):
+
+$$\text{LUFS}_{\text{loudest}}(x) = \max_{k \in \{0, 1, \dots\}} \text{LUFS}\Big( x\big[ k \cdot f_s : k \cdot f_s + 3 f_s \big] \Big)$$
+
+$$\text{makeup}_{\text{requested}} = \max\Big( 0.0, \ \text{LUFS}_{\text{loudest}}(\text{ref}) - \text{LUFS}_{\text{loudest}}(\text{out}) \Big)$$
+
+* 믹스가 레퍼런스보다 조용할 때만 게인을 올리고, 이미 더 크면 줄이지 않는다($\max(0.0, \cdot)$).
+
+---
+
+## 21. 미분 가능 볼륨 최적화 — Adam 과 GR 3 dB 안전 장벽
+
+**문제**: 기계적으로 볼륨을 올리면 컴퓨터는 리미터로 인한 사각파 찌그러짐을 듣지 못하므로 무한정 밀어붙여 소리가 뭉개진다.
+
+**Adam 점진적 볼륨 최적화** (목표 부스트 $\Delta L_{\text{tgt}}$ 에서 시작, $\eta = 0.05$, $n = 800$ 스텝):
+
+$$\mathcal{L}_{\text{vol}} = \operatorname{ReLU}\big( \Delta L_{\text{tgt}} - G_{\text{drive}} \big)^2 + \underbrace{25.0 \cdot \operatorname{ReLU}\big( |\text{GR}_{\text{max}}| - 3.0\ \text{dB} \big)^2}_{\text{리미터 3 dB 상한선 안전 페널티}}$$
+
+```python
+drive_gain = nn.Parameter(torch.full((1,), target_boost))  # 목표 부스트에서 시작
+opt = optim.Adam([drive_gain], lr=0.05)    # 전 모듈 공통 학습률
+
+for _ in range(800):
+    opt.zero_grad()
+    out, gr = limiter(eval_slice, input_gain_db=drive_gain, return_gr=True)
+    
+    loss_vol = torch.relu(target_boost - drive_gain) ** 2
+    loss_gr  = torch.relu(-gr["gr_tensor"].min() - 3.0) ** 2 * 25.0
+    
+    (loss_vol + loss_gr).backward()
+    opt.step()
+```
+
+> **엔지니어 워크플로우 재현**: $0\ \text{dB}$에서 시작해 서서히 볼륨을 올리다가, 목표 LUFS나 리미터 안전 한계($3.0\ \text{dB}$)에 닿는 순간 칼같이 브레이크를 밟아 **스윗스팟에서 정착**한다.
+
+---
+
+## 22. 미분 가능한 마스터링 리미터 (`DifferentiableLimiter`)
+
+믹싱 컴프와 동일한 엔진(`_OnePoleBallistics` + Soft-knee)을 리미터/맥시마이저 구조로 특화:
+
+**1. 스테레오 링크 피크 검출** ($H_d = 64, W_d = 128$ samples $\approx 1.45\ \text{ms}$, Ceiling $C_{\text{dB}} = -0.3$):
+
+$$\mathbf{x}_{\text{driven}} = \mathbf{x} \cdot 10^{\,\text{input\_gain\_db} / 20}$$
+
+$$\text{env}[k] = \max_{c \in \{L, R\}} \max_{n \in [k H_d, k H_d + W_d)} |x_{\text{driven}, c}[n]|, \qquad E_k = 20 \log_{10}(\text{env}[k] + \epsilon)$$
+
+**2. 미세 소프트니 ($K = 1.0\ \text{dB}$) 오버슛 및 높은 압축비 ($R = 50.0 : 1$)**:
+
+$$o_k = \begin{cases} 0 & (E_k - C_{\text{dB}} < -K/2) \\ E_k - C_{\text{dB}} & (E_k - C_{\text{dB}} > K/2) \\ \dfrac{(E_k - C_{\text{dB}} + K/2)^2}{2K} & (\text{soft knee 구간}) \end{cases}$$
+
+$$G^{\text{tgt}}_k = -o_k \cdot \left( 1 - \frac{1}{R} \right) \qquad (R = 50.0)$$
+
+---
+
+## 22-B. 밸리스틱 수반 재귀와 선형 업샘플링
+
+**3. 어택/릴리즈 밸리스틱 평활화** ($\tau_a = 0.1\ \text{ms}, \ \tau_r = 80\ \text{ms}$):
+
+$$G_k = \text{\_OnePoleBallistics}(G^{\text{tgt}}_k, \ a_{\text{att}}, \ a_{\text{rel}})$$
+
+* $a_{\text{att}} = \exp(-\Delta t / 0.1\ \text{ms}) \approx 0.0$, $a_{\text{rel}} = \exp(-\Delta t / 80\ \text{ms}) \approx 0.982$
+* 믹싱 컴프와 동일하게 **수반 재귀(Adjoint Recursion)**로 $O(M)$ 분석적 역전파 보장.
+
+**4. 선형 보간 및 최종 안전 클램프**:
+
+$$g[n] = 10^{\,\text{interp}(G)[n] / 20}, \qquad \mathbf{y}[c, n] = \mathbf{x}_{\text{driven}}[c, n] \cdot g[n]$$
+
+$$\mathbf{y} \leftarrow \operatorname{clip}(\mathbf{y}, -C_{\text{lin}}, C_{\text{lin}}) \qquad (C_{\text{lin}} = 10^{-0.3/20} \approx 0.966)$$
+
+* 동일한 게인 곡선 $g[n]$ 이 L과 R에 똑같이 적용되어 **스테레오 위상과 중앙 이미지가 완벽 보존**된다.
+
+---
+
+## 23. 현재 마스터링 체인의 특성과 한계 분석
+
+| 단계 | 현재 수학적 방식 | 장점 | 한계 및 개선점 |
+|---|---|---|---|
+| **EQ** | 15-band DDSP (`hard_clamp=False`, $\lambda_2=1.0, \lambda_s=1.0$) | 전체 음량 변동 없이 절제된 완만한 톤 보정 | 모노 다운믹스 기준이므로 스테레오 Side 대역 미고려 |
+| **라우드니스** | 3초 슬라이딩 윈도우 최대 LUFS | 무음 구간 왜곡 없이 하이라이트 레벨 매칭 | 곡 전체 거시적 다이내믹 레인지(LRA) 미제어 |
+| **게인 루프** | GR $\le 3.0\ \text{dB}$ 예산 기반 수렴 | 리미터 과부하로 인한 사각파 디스토션 방지 | 중간 단계(글루 컴프 등)가 없어 볼륨 확보 한계 |
+| **리미터** | **DifferentiableLimiter** (Stereo-linked, $R=50$, $K=1$, STE) | **PyTorch 미분 가능**, 즉각 피크 억제 | 다이내믹스 E2E 공동 최적화 루프 연결 대기 |
 
 <!--
 ---
