@@ -109,8 +109,10 @@ async def api_match_eq(
         inst_path = os.path.join(UPLOADS_DIR, inst_filename)
         fullmix_path = os.path.join(OUTPUTS_DIR, f"fullmix_{session_id}.wav")
         fullmix_raw_path = os.path.join(OUTPUTS_DIR, f"fullmixraw_{session_id}.wav")
-        if master:
-            mastered_path = os.path.join(OUTPUTS_DIR, f"mastered_{session_id}.wav")
+    # 마스터링은 반주 유무와 무관하게 돌린다. 반주가 없으면(나레이션/강의 녹음 등)
+    # 처리된 보컬 자체가 마스터링 대상이 된다.
+    if master:
+        mastered_path = os.path.join(OUTPUTS_DIR, f"mastered_{session_id}.wav")
     
     try:
         # Save uploaded files
@@ -218,9 +220,11 @@ async def api_match_eq(
 
         # Mastering (optional): 풀믹스 톤/라우드니스를 레퍼런스 곡에 맞추고 브릭월 리미터
         mastering_info = None
-        if has_instrumental and master:
+        if master:
+            # 반주가 있으면 풀믹스를, 없으면 처리 완료된 보컬(EQ→Comp→Reverb 후)을 마스터링한다.
+            master_src = fullmix_path if has_instrumental else out_path
             mastering_info = master_track(
-                mix_path=fullmix_path,
+                mix_path=master_src,
                 ref_path=ref_path,       # 업로드한 레퍼런스 곡(풀 곡) 기준
                 out_path=mastered_path
             )
@@ -244,8 +248,9 @@ async def api_match_eq(
             audio_urls["instrumental"] = f"/data/uploads/{inst_filename}"
             audio_urls["full_mix"] = f"/data/outputs/fullmix_{session_id}.wav"
             audio_urls["full_mix_raw"] = f"/data/outputs/fullmixraw_{session_id}.wav"
-            if master and mastered_path:
-                audio_urls["full_mix_mastered"] = f"/data/outputs/mastered_{session_id}.wav"
+        # 반주 없이 보컬만 마스터링한 경우도 같은 키로 내려 프런트 플레이어/다운로드가 그대로 잡게 한다.
+        if master and mastered_path:
+            audio_urls["full_mix_mastered"] = f"/data/outputs/mastered_{session_id}.wav"
 
         return {
             "status": "success",

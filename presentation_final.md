@@ -425,23 +425,33 @@ $$\text{LUFS} = -0.691 + 10\log_{10}\left( \frac{\sum_j g_j z_j}{\sum_j g_j} \ri
 
 ---
 
-## 17. 마스터링 1단계: Full-band Mastering EQ (`master_track`)
+## 17. 마스터링 1단계: Mastering EQ (`master_track`)
 
-풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭 (`modules.py:818-845` 구현 기반):
+풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭 (`modules.py:828-863` 구현 기반):
 
 ### 1) 믹싱 EQ vs 마스터링 EQ 파라미터 비교
 
 | 파라미터 | 보컬 믹싱 EQ (`DifferentiableEQ`) | 마스터링 EQ (`master_track`) | 코드 위치 / 설정 근거 |
 |---|---|---|---|
 | **처리 대상** | 단일 보컬 트랙 | 풀믹스 트랙 | `modules.py:812` |
-| **주파수 대역** | **$200\text{ Hz} \sim 10\text{ kHz}$** | **$20\text{ Hz} \sim 20\text{ kHz}$** | `modules.py:117-120` 주석 |
-| **밴드 수 (`num_bands`)** | 17-Band | 15-Band | `modules.py:793` |
-| **게인 스케일 계수 (`gain_scale_db`)** | $15.0\text{ dB}$ (기울기 스케일 $d/d\theta$) | $8.0\text{ dB}$ (기울기 스케일 $d/d\theta$) | `modules.py:163, 794` |
-| **클램프 (`hard_clamp`)** | `False` (선형 개방) | `False` (선형 개방) | `modules.py:819` 주석 |
-| **L2 페널티 (`eq_l2`)** | $0.1$ | **$1.0$** | `modules.py:820` 주석 |
-| **스무딩 페널티 (`eq_smooth`)** | $0.1$ | **$1.0$** | `modules.py:820` 주석 |
-| **학습률 (`lr_eq`)** | `0.05` (실제 변위 $\approx 0.75\text{ dB/step}$) | **`0.05`** (실제 변위 $\approx 0.40\text{ dB/step}$) | `pipeline.py:831`, `modules.py:798, 841` |
-| **반복 횟수 (`eq_iters`)** | 50 (E2E 전체 파이프라인) | **300** (스펙트럼 매칭 루프) | `modules.py:794` |
+| **주파수 대역** | **$200\text{ Hz} \sim 10\text{ kHz}$** | **$20\text{ Hz} \sim 10\text{ kHz}$** | `modules.py:117-120, 835` |
+| **밴드 수 (`num_bands`)** | 17-Band | 15-Band | `modules.py:805` |
+| **게인 스케일 계수 (`gain_scale_db`)** | $15.0\text{ dB}$ (기울기 스케일 $d/d\theta$) | $8.0\text{ dB}$ (기울기 스케일 $d/d\theta$) | `modules.py:163, 806` |
+| **클램프 (`hard_clamp`)** | `False` (선형 개방) | `False` (선형 개방) | `modules.py:833` 주석 |
+| **L2 페널티 (`eq_l2`)** | $0.1$ | **$1.0$** | `modules.py:807` 주석 |
+| **스무딩 페널티 (`eq_smooth`)** | $0.1$ | **$1.0$** | `modules.py:807` 주석 |
+| **학습률 (`lr_eq`)** | `0.05` (실제 변위 $\approx 0.75\text{ dB/step}$) | **`0.05`** (실제 변위 $\approx 0.40\text{ dB/step}$) | `pipeline.py:831`, `modules.py:807, 841` |
+| **반복 횟수 (`eq_iters`)** | 50 (E2E 전체 파이프라인) | **300** (스펙트럼 매칭 루프) | `modules.py:806` |
+
+---
+
+### 2) 왜 마스터링 EQ는 $20\text{ Hz} \sim 10\text{ kHz}$ 대역을 타깃하는가?
+
+* **저역 ($20\text{ Hz} \sim 200\text{ Hz}$)을 온전히 살리는 이유 (킥/베이스 보존)**:
+  - 믹싱에서는 보컬 분리 AI의 베이스 마스킹 회피를 위해 저역을 배제했으나, 마스터링은 **풀믹스 원곡 레퍼런스**를 사용하므로 킥 드럼과 서브베이스가 온전히 보존되어 있어 저역 톤 밸런스를 $20\text{ Hz}$부터 정밀하게 매칭함.
+* **고역 상한선을 $10\text{ kHz}$로 제한하는 이유 (코덱 절벽 방지)**:
+  - 레퍼런스가 MP3/AAC 등 손실 압축 음원일 경우 $15\sim 16\text{ kHz}$ 이상에서 주파수가 잘려나가는 **코덱 절벽(Codec Cliff)** 현상이 존재함.
+  - 평가 대역을 $10\text{ kHz}$ 이하(`mel_mask`)로 한정하여, 레퍼런스의 코덱 압축 결함을 따라 믹스의 에어감(Air Band)을 부당하게 깎아버리는 음향 왜곡을 원천 차단함 (`modules.py:833`).
 
 ---
 

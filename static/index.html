@@ -28,7 +28,7 @@
             <section class="panel-left">
                 <!-- File Uploads -->
                 <div class="card upload-section">
-                    <h2 class="section-title"><span class="num">1</span> 오디오 파일 업로드</h2>
+                    <h2 class="section-title">오디오 파일 업로드</h2>
                     
                     <!-- Raw Vocal Upload -->
                     <div class="upload-box" id="raw-upload-box">
@@ -54,7 +54,7 @@
 
                     <!-- Auto vocal extraction toggle -->
                     <label id="separate-ref-row" style="display:flex; align-items:center; gap:10px; margin-top:12px; padding:10px 14px; background:rgba(155,81,224,0.08); border:1px solid rgba(155,81,224,0.3); border-radius:8px; cursor:pointer; font-size:0.9rem;">
-                        <input type="checkbox" id="separate-ref-check" style="width:18px; height:18px; accent-color:#9b51e0; cursor:pointer;">
+                        <input type="checkbox" id="separate-ref-check" checked style="width:18px; height:18px; accent-color:#9b51e0; cursor:pointer;">
                         <span>🤖 레퍼런스에서 <strong>보컬 자동 추출</strong> — 아카펠라 없이 <strong>풀 곡</strong>을 넣어도 AI가 보컬만 분리해 사용 <span style="color:#a0a8c0; font-size:0.8rem;">(분리에 1~3분 소요)</span></span>
                     </label>
 
@@ -72,7 +72,7 @@
 
                 <!-- Parameters Settings -->
                 <div class="card settings-section">
-                    <h2 class="section-title"><span class="num">2</span> 믹싱 파라미터 설정</h2>
+                    <h2 class="section-title">믹싱 파라미터 설정</h2>
                     
                     <div class="control-group">
                         <div class="control-label">
@@ -139,9 +139,9 @@
 
                             <div class="control-label" style="margin-top:12px;">
                                 <label for="manual-wet">잔향 비율 (Wet / Dry)</label>
-                                <span class="value-display" id="manual-wet-val">30%</span>
+                                <span class="value-display" id="manual-wet-val">20%</span>
                             </div>
-                            <input type="range" id="manual-wet" min="0" max="1" step="0.01" value="0.3" class="slider">
+                            <input type="range" id="manual-wet" min="0" max="1" step="0.01" value="0.2" class="slider">
                             <span class="help-text">출력 = (1−wet)·원음 + wet·잔향. 100%면 원음이 전부 잔향으로 대체됩니다.</span>
 
                             <span class="help-text" style="display:block; margin-top:10px; color:#00f2fe;">수동 모드는 레퍼런스에서 아무것도 추정하지 않습니다 — IR 추정(최초 약 60초)과 학습을 모두 건너뛰므로 훨씬 빠릅니다.</span>
@@ -158,9 +158,9 @@
                     <div class="control-group">
                         <div class="control-label">
                             <label for="match-amount">보컬 매칭 강도 (Matching Strength)</label>
-                            <span class="value-display" id="match-amount-val">80%</span>
+                            <span class="value-display" id="match-amount-val">100%</span>
                         </div>
-                        <input type="range" id="match-amount" min="0" max="1" step="0.05" value="0.8" class="slider">
+                        <input type="range" id="match-amount" min="0" max="1" step="0.05" value="1.0" class="slider">
                         <span class="help-text">레퍼런스의 음색(EQ)과 다이내믹(컴프레서)을 얼마나 복사하여 매칭할지 조절합니다.</span>
                     </div>
 
@@ -178,47 +178,11 @@
 
                     <div class="control-group">
                         <div class="control-label">
-                            <label for="eq-bands">이큐 밴드 개수 (EQ Bands Count)</label>
-                            <span class="value-display" id="eq-bands-val">17</span>
-                        </div>
-                        <input type="range" id="eq-bands" min="3" max="31" step="1" value="17" class="slider">
-                        <span class="help-text">최적화에 사용할 파라메트릭 이큐 필터 밴드의 개수입니다. 밴드는 <strong>200 Hz ~ 10 kHz</strong> 로그 등간격으로 놓입니다 — 200 Hz 아래는 보컬 분리 과정에서 저역이 소실되고, 10 kHz 위는 mp3 등 손실 압축으로 정보가 없어 둘 다 매칭 대상에서 제외했습니다. (3 ~ 31개)</span>
-                    </div>
-
-                    <div class="control-group">
-                        <div class="control-label">
-                            <label for="eq-l2">이큐 게인 페널티 (EQ L2)</label>
-                            <span class="value-display" id="eq-l2-val">0.1000</span>
-                        </div>
-                        <input type="range" id="eq-l2" min="0" max="0.5" step="0.0005" value="0.1" class="slider">
-                        <span class="help-text">밴드 게인 크기 제곱 페널티. 크게 하면 부스트/컷 폭이 전체적으로 작아집니다. 0.0005 단위로 조절되며 0이면 제한 없음.</span>
-                    </div>
-
-                    <div class="control-group">
-                        <div class="control-label">
-                            <label for="eq-smooth">이큐 커브 평활 페널티 (EQ Smooth)</label>
-                            <span class="value-display" id="eq-smooth-val">0.1000</span>
-                        </div>
-                        <input type="range" id="eq-smooth" min="0" max="2" step="0.0005" value="0.1" class="slider">
-                        <span class="help-text">인접 밴드 게인 차이의 제곱 페널티. 크게 하면 이큐 커브가 매끈해지고 톱니 모양이 사라집니다.</span>
-                    </div>
-
-                    <div class="control-group">
-                        <div class="control-label">
                             <label for="comp-ratio">컴프 압축비 (Ratio)</label>
                             <span class="value-display" id="comp-ratio-val">10.0 : 1</span>
                         </div>
                         <input type="range" id="comp-ratio" min="1" max="30" step="0.5" value="10" class="slider">
                         <span class="help-text">얼마나 세게 누를지. 1 = 무압축, 3 = 보컬 표준, 10 이상 = 리미터에 가까움. 학습 대상이 아니라 직접 고르는 값이며, threshold 는 이 값에 맞춰 학습됩니다.</span>
-                    </div>
-
-                    <div class="control-group">
-                        <div class="control-label">
-                            <label for="comp-thresh">컴프 threshold 심도 페널티 (Comp Threshold)</label>
-                            <span class="value-display" id="comp-thresh-val">0.0000</span>
-                        </div>
-                        <input type="range" id="comp-thresh" min="0" max="2" step="0.0005" value="0" class="slider">
-                        <span class="help-text">threshold 가 신호 아래(-60dB 쪽)로 깊게 내려가는 것을 막습니다. ratio 가 3:1 로 고정돼 있어 threshold 혼자 압축량을 결정하므로, 바닥까지 내려가면 컴프가 아니라 포락선 스케일러가 됩니다. 0이면 비활성.</span>
                     </div>
 
                     <div class="control-group">
@@ -233,7 +197,7 @@
                     <div class="control-group">
                         <label id="master-row" style="display:flex; align-items:center; gap:10px; padding:10px 14px; background:rgba(0,242,254,0.08); border:1px solid rgba(0,242,254,0.3); border-radius:8px; cursor:pointer; font-size:0.9rem;">
                             <input type="checkbox" id="master-check" checked style="width:18px; height:18px; accent-color:#00f2fe; cursor:pointer;">
-                            <span>🎚️ <strong>마스터링</strong> — 풀믹스 톤을 레퍼런스 곡에 맞추고 라우드니스 매칭 + 브릭월 리미터 <span style="color:#a0a8c0; font-size:0.8rem;">(반주 업로드 시에만)</span></span>
+                            <span>🎚️ <strong>마스터링</strong> — 톤을 레퍼런스 곡에 맞추고 라우드니스 매칭 + 브릭월 리미터 <span style="color:#a0a8c0; font-size:0.8rem;">(반주가 없으면 처리된 보컬만 마스터링)</span></span>
                         </label>
                     </div>
 
@@ -448,7 +412,7 @@
                 <!-- Interactive Player Dashboard -->
                 <div class="card player-card">
                     <div class="title-row-with-badge">
-                        <h2 class="section-title"><span class="num">4</span> 모니터링 & 비교 (A/B Test)</h2>
+                        <h2 class="section-title">모니터링 & 비교 (A/B Test)</h2>
                     </div>
                     
                     <div class="player-controls-container">
@@ -502,6 +466,6 @@
     <audio id="audio-fullmix-raw" preload="auto"></audio>
     <audio id="audio-mastered" preload="auto"></audio>
 
-    <script src="/static/app.js?v=14"></script>
+    <script src="/static/app.js?v=16"></script>
 </body>
 </html>

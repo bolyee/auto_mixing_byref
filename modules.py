@@ -113,11 +113,11 @@ class DifferentiableEQ(nn.Module):
     Bands are placed at log-uniform spacing over [min_freq, max_freq], so the
     spacing is constant in octaves and the band widths are constant-Q.
 
-    The band range matters more than it looks: it is the parameter domain, so
-    anything outside it simply cannot be represented. The vocal chain passes
-    200 Hz – 10 kHz (`pipeline.VOCAL_EQ_MIN_FREQ` / `VOCAL_EQ_MAX_FREQ`) to match
-    the tone loss evaluation band exactly. The mastering EQ keeps the full
-    20 Hz – 20 kHz range, since there the whole spectrum is being matched.
+    The vocal chain passes 200 Hz – 10 kHz (`pipeline.VOCAL_EQ_MIN_FREQ` /
+    `VOCAL_EQ_MAX_FREQ`) to match the tone loss evaluation band exactly.
+    The mastering EQ passes 20 Hz – 10 kHz: keeping 20 Hz to preserve the
+    full-mix kick/bass envelope, while capping at 10 kHz to avoid high-frequency
+    codec cutoff artifacts from lossy reference audio.
     """
     def __init__(self, sample_rate, n_fft, num_bands=31, min_freq=20.0, max_freq=20000.0,
                  gain_scale_db=15.0, hard_clamp=True, max_gain_db=None):
@@ -810,7 +810,7 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
     """
     최종 풀믹스 마스터링: 레퍼런스 곡의 톤(EQ)을 따라가고 라우드니스를 맞춘 뒤 DifferentiableLimiter 로 피크 제한.
 
-    1) 풀밴드 DDSP EQ 로 풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭(hard_clamp=False, L2/스무딩 페널티 1.0).
+    1) 20 Hz ~ 10 kHz DDSP EQ로 풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭(hard_clamp=False, L2/스무딩 페널티 1.0, 코덱 절벽 방지).
     2) 레퍼런스의 활성 RMS(최대 3초 LUFS)에 맞춰 볼륨(인풋 드라이브 게인) 계산.
     3) DifferentiableLimiter(미분 가능한 스테레오 링크 리미터: ratio 50:1, attack 0.1ms, release 80ms, knee 1.0dB)로
        천장(-0.3 dBFS)을 향해 볼륨을 밀어 올리면서 피크를 제어하고 클리핑을 방지.
@@ -829,10 +829,18 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
     mix_mag, _, mel_fb = compute_spectral_envelope(mix.mean(0), sr, n_fft, hop, n_mels)
     _, ref_mel, _ = compute_spectral_envelope(ref.mean(0), sr, n_fft, hop, n_mels)
 
-    # --- Full-band EQ match (mix tone → reference tone) ---
+    # 손실 압축 음원(MP3/AAC)의 코덱 컷오프(16 kHz)로 인한 초고역 오차 왜곡 방지:
+    # 10 kHz 이하의 신뢰 구간만 손실 함수 평가 대역으로 지정
+    mel_freqs = librosa.mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=sr / 2.0)
+    mel_mask = torch.tensor(mel_freqs <= 10000.0, dtype=torch.bool)
+
+    # --- Mastering EQ match (mix tone → reference tone) ---
     # hard_clamp=False: 믹싱과 동일하게 벽(tanh)을 없애고 선형 개방.
-    # 대신 eq_l2=1.0, eq_smooth=1.0 페널티로 매우 미세하고 완만하게만 작동하게 제한.
-    eq = DifferentiableEQ(sample_rate=sr, n_fft=n_fft, num_bands=num_bands, gain_scale_db=gain_scale_db, hard_clamp=False)
+    # 대역: 20 Hz ~ 10 kHz (풀믹스 저역 킥/베이스는 온전히 반영하되, MP3/AAC 코덱 절벽으로 인한 에어 대역 훼손 방지)
+    # 페널티: eq_l2=1.0, eq_smooth=1.0 페널티로 매우 미세하고 완만하게만 작동하게 제한.
+    eq = DifferentiableEQ(sample_rate=sr, n_fft=n_fft, num_bands=num_bands,
+                          min_freq=20.0, max_freq=10000.0,
+                          gain_scale_db=gain_scale_db, hard_clamp=False)
     # lr 은 raw 파라미터 θ 의 스텝이고, 실제로 움직이는 양은 gain_scale_db 를 곱한
     # dB 다(= lr × gain_scale_db). 믹싱 EQ(`pipeline.match_e2e` 의 lr_eq)와 같은 값을
     # 쓰되 여기 gain_scale_db 가 8(믹싱 15)이라, dB 로 환산하면 0.4 dB/step 으로
@@ -851,8 +859,8 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         filt_mel_norm = filt_mel / (torch.sum(filt_mel) + eps)
         filt_mel_db = 10.0 * torch.log10(filt_mel_norm + eps)
 
-        # 톤 매칭 MSE + L2 게인 크기 페널티 (eq_l2=1.0) + 인접 밴드 급변 억제 페널티 (eq_smooth=1.0)
-        loss = torch.mean((filt_mel_db - ref_mel_db) ** 2)
+        # 톤 매칭 MSE (10 kHz 이하 코덱 안전 대역만 평가) + L2 게인 크기 페널티 (eq_l2=1.0) + 인접 밴드 급변 억제 페널티 (eq_smooth=1.0)
+        loss = torch.mean((filt_mel_db[mel_mask] - ref_mel_db[mel_mask]) ** 2)
         if eq_l2 > 0.0:
             loss = loss + eq_l2 * torch.mean(gains ** 2)
         if eq_smooth > 0.0 and gains.numel() > 1:

@@ -36,17 +36,13 @@ const matchAmountVal = document.getElementById('match-amount-val');
 // 리버브만 줄여야 하는데, 하나로 묶으면 EQ·컴프까지 같이 약해진다.
 const reverbAmountSlider = document.getElementById('reverb-amount');
 const reverbAmountVal = document.getElementById('reverb-amount-val');
-const eqBandsSlider = document.getElementById('eq-bands');
-const eqBandsVal = document.getElementById('eq-bands-val');
-// 손실 정규화(페널티) 계수. 개발 중 값을 자주 바꿔가며 튜닝하므로 UI 로 뺐다.
-const eqL2Slider = document.getElementById('eq-l2');
-const eqL2Val = document.getElementById('eq-l2-val');
-const eqSmoothSlider = document.getElementById('eq-smooth');
-const eqSmoothVal = document.getElementById('eq-smooth-val');
+// 이큐 밴드 개수와 게인 페널티(L2)는 더 이상 사용자가 만지지 않는다.
+// 최적값으로 고정 — 서버(main.py / pipeline.VOCAL_EQ_BANDS)의 기본값과 같다.
+const EQ_NUM_BANDS = 17;
+const EQ_L2 = 0.1;
+const EQ_SMOOTH = 0.1;
 const compRatioSlider = document.getElementById('comp-ratio');
 const compRatioVal = document.getElementById('comp-ratio-val');
-const compThreshSlider = document.getElementById('comp-thresh');
-const compThreshVal = document.getElementById('comp-thresh-val');
 const vocalGainSlider = document.getElementById('vocal-gain');
 const vocalGainVal = document.getElementById('vocal-gain-val');
 
@@ -75,20 +71,8 @@ matchAmountSlider.addEventListener('input', (e) => {
 reverbAmountSlider.addEventListener('input', (e) => {
     reverbAmountVal.textContent = Math.round(e.target.value * 100) + '%';
 });
-eqBandsSlider.addEventListener('input', (e) => {
-    eqBandsVal.textContent = e.target.value;
-});
-eqL2Slider.addEventListener('input', (e) => {
-    eqL2Val.textContent = parseFloat(e.target.value).toFixed(4);
-});
-eqSmoothSlider.addEventListener('input', (e) => {
-    eqSmoothVal.textContent = parseFloat(e.target.value).toFixed(4);
-});
 if (compRatioSlider) compRatioSlider.addEventListener('input', (e) => {
     compRatioVal.textContent = `${parseFloat(e.target.value).toFixed(1)} : 1`;
-});
-compThreshSlider.addEventListener('input', (e) => {
-    compThreshVal.textContent = parseFloat(e.target.value).toFixed(4);
 });
 vocalGainSlider.addEventListener('input', (e) => {
     const v = parseFloat(e.target.value);
@@ -359,11 +343,10 @@ processBtn.addEventListener('click', async () => {
     const formData = new FormData();
     formData.append('raw_vocal', rawFile);
     formData.append('ref_vocal', refFile);
-    formData.append('num_bands', eqBandsSlider.value);
-    formData.append('eq_l2', eqL2Slider.value);
-    formData.append('eq_smooth', eqSmoothSlider.value);
+    formData.append('num_bands', EQ_NUM_BANDS);
+    formData.append('eq_l2', EQ_L2);
+    formData.append('eq_smooth', EQ_SMOOTH);
     if (compRatioSlider) formData.append('comp_ratio', compRatioSlider.value);
-    formData.append('comp_thresh_weight', compThreshSlider.value);
     formData.append('match_amount', matchAmountSlider.value);
     formData.append('smoothness', '1.0');
     formData.append('match_volume', 'true');
