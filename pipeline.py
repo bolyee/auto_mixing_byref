@@ -1,41 +1,4 @@
-"""
-End-to-End Joint Training 파이프라인.
-
-기존 `modules.py` 의 순차(greedy) 최적화 — EQ 500 epoch → 1176 컴프(numpy) → 리버브 100 epoch —
-를 대체한다. EQ / Compressor / Reverb 의 모든 파라미터를 **단일 연산 그래프**에 연결해
-모듈별로 분리된 손실(`losses.DSPMatchingLoss`)로 각각 역전파한다.
-
-    forward:   STFT → EQ → iSTFT → Compressor → Reverb        (직렬, numpy 왕복 0회)
-    backward:  L_tone ← tone_src = Rev(Comp(y_eq, sg[θ_T])) → θ   (EQ)   (경로 분리)
-               L_dyn  ← dyn_src  = Rev(Comp(sg[y_eq], θ_T)) → θ_T (Comp)
-               ※ 리버브 통과 여부는 LOSS_MEASURE_POINT ("post_reverb" 기본)
-
-각 손실이 자기 모듈만 움직인다는 성질을 **그래디언트 경로를 끊어서** 보장한다. 예전에는
-세 손실을 가중합으로 묶고 침범 방지용 정규화 항으로 통제했는데, 구조로 보장되므로 그
-항들은 삭제했다(`losses.py` 상단 주석 참조).
-
-DSP 모듈(DifferentiableEQ / DifferentiableCompressor / DifferentiableReverb)과 유틸은
-`modules.py` 것을 그대로 임포트해 재사용한다. 이 파일은 **연결과 학습 루프만** 담당한다.
-
-기존 파이프라인 대비 달라진 점
-------------------------------
-1. **그래프 절단 제거.** 기존 `match_eq` 는 EQ 학습 후 `.numpy()` / `librosa.istft` 로
-   빠져나갔다가 numpy 1176 컴프를 거쳐 `torch.tensor()` 로 그래프를 새로 시작했다.
-   전부 `torch.stft` / `torch.istft` 체인으로 대체해 numpy 왕복이 0회다.
-2. **미분 가능 컴프 사용.** `match_compression_1176`(이진탐색 50회, 미분 불가) 대신
-   `DifferentiableCompressor`. 샘플 단위 피크 밸리스틱을 잃는 대신 그래디언트를 얻는다.
-3. **학습 구간 크로스페이드.** `legacy/ddsp.py:69` `extract_active_segments` 는 비연속 5초 블록을
-   그냥 `torch.cat` 해서 경계에 인위적 attack/decay 를 만든다. 이는 EDC 기울기 통계를
-   직접 오염시키므로 여기서는 크로스페이드 버전을 쓴다.
-
-알려진 한계
------------
-· rt60 / wet 축퇴: 전대역 RT60 이 1개뿐이라 "rt60↑ + wet↓" 와 "rt60↓ + wet↑" 가
-  EDC 기울기에 거의 같은 효과를 낸다. 실측에서 wet 이 먼저 수렴하며 rt60 을 끌어내렸다.
-  RT60 을 추출값으로 고정해 자유도 하나를 없애서 이 축퇴를 피한다.
-· 비용: 10초 학습 구간 · 60 step 기준 약 14초 (M1 CPU, 렌더링 포함).
-  기존 순차 방식(1~2초)보다 훨씬 느리다. `n_steps` 로 조절한다.
-"""
+"""보컬 E2E 매칭 파이프라인: EQ, 컴프레서, 수동 리버브의 처리와 결과 지표를 담당한다."""
 
 import os
 from typing import Dict, List, Optional, Tuple
@@ -49,7 +12,6 @@ import torch.optim as optim
 
 from modules import (
     DifferentiableCompressor,
-    MeasuredIRReverb,
     DifferentiableEQ,
     DifferentiableReverb,
     compute_spectral_envelope,
@@ -62,7 +24,6 @@ from losses import DSPMatchingLoss, LoudnessMeter
 __all__ = ["match_e2e", "E2EChain"]
 
 TARGET_SR = 44100
-SMOOTH_MS = 10.0
 N_FFT = 2048
 HOP_LENGTH = 512
 N_MELS = 80
@@ -102,44 +63,10 @@ VOCAL_EQ_BANDS = 17
 # 애초에 같은 축이 아니다. 지금은 §17 지표도 같은 하이라이트 구간에서 잰다.
 #
 # 부수 효과로 컴프 밸리스틱 재귀가 O(M) 이라 스텝이 크게 빨라진다
-# (실측 곡 전체 128 s 2537 ms → 15 s 273 ms, 9.3배).
-COMP_TRAIN_SECONDS: Optional[float] = 15.0
+# (실측 곡 전체 128 s 2537 ms → 10 s 180 ms, 약 14배).
+COMP_TRAIN_SECONDS: Optional[float] = 10.0
 
-# 손실을 **어디서 재고**, 그래디언트를 **어디로 흘릴지**.
-#
-#   "selective" (기본) — 두 손실 모두 컴프 통과 후 신호에서 재되, 경로는 갈라 둔다.
-#         tone_src = Comp(y_eq, sg[θ_T])   ← θ 로만 흐름 (컴프 파라미터 고정)
-#         dyn_src  = Comp(sg[y_eq], θ_T)   ← θ_T 로만 흐름 (컴프 입력 고정)
-#       (기본값 LOSS_MEASURE_POINT="post_reverb" 에서는 두 신호가 여기서 리버브를 한 번
-#        더 통과한 뒤 손실에 들어간다 — 아래 LOSS_MEASURE_POINT 주석 참조.)
-#       sg 는 forward 값을 바꾸지 않으므로 두 신호와 실제 출력이 **수치적으로 동일**하다.
-#       "손실이 듣는 소리"는 최종 출력과 같으면서, 모듈 간 간섭은 없다.
-#
-#   "split" — 예전 분리 모드. 톤을 컴프 **이전**(y_eq)에서 잰다. 컴프가 만드는 스펙트럼
-#       변화를 EQ 가 보지 못한다.
-#
-#   "unified" — 완전 결합. sg 없이 둘 다 y_full 에서 잰다. 실제 곡에서 PLR 이 목표와
-#       반대로 튀고(13.89 → 17.16 dB) EQ 가 저역을 −25 dB 까지 깎는 실패가 관측됐다.
-#       L_dyn 이 θ 를, L_tone 이 θ_T 를 서로 잘못된 방향으로 끌어당긴 결과다. 재현용으로만
-#       남겨 둔다.
-LOSS_GRAD_MODE: str = "selective"
-
-# 톤/다이내믹 손실을 **리버브 앞에서 재는가 뒤에서 재는가**.
-#
-#   "post_reverb" (기본) — tone_src·dyn_src 를 리버브까지 통과시킨 뒤 잰다. 손실이 보는
-#       신호가 실제로 저장되는 출력과 같아지고(§18 감사 A 계열의 불일치 해소), EQ·컴프의
-#       그래디언트가 리버브를 **관통해서** 흐른다. 리버브에 학습 파라미터가 없어도(측정 IR)
-#       컨볼루션은 선형이라 backward 가 성립한다.
-#   "pre_reverb" — 예전 동작. 컴프 출력에서 바로 잰다. 리버브는 렌더 전용 후처리가 된다.
-#
-# 대가: 스텝마다 곡 전체 길이 FFT 컨볼루션이 tone·dyn 각각 한 번씩(+backward) 더 붙는다.
-# 실측 비용은 README / 아래 벤치마크 주석 참조.
-#
-# 주의(비대칭): 타깃은 레퍼런스 **원본**(이미 잔향이 걸린 신호)이고, 우리 쪽은 여기서
-# 레퍼런스에서 추정한 IR 을 한 번 더 얹는다. 내 보컬에 원래 있던 잔향이 남아 있으므로
-# 엄밀히는 "웻+웻 대 웻" 이다. 레퍼런스 디리버브(`ref_dry`)가 들어오기 전까지는 남는 갭이다.
-LOSS_MEASURE_POINT: str = "post_reverb"
-
+# 학습 손실은 실제 리버브 출력에서 측정하고 각 모듈로 가는 그래디언트는 분리한다.
 # 컴프 ratio. **학습하지 않는 설정 상수**다(§7 — 학습시키면 R→1 에서 그래디언트가
 # 소멸해 bypass 가 흡인점이 되고, threshold 와 축퇴가 생긴다). 학습 대상은 threshold
 # 하나뿐이라는 구조는 그대로 두고, 값만 곡·상황에 맞게 고를 수 있게 열어 둔다.
@@ -150,258 +77,8 @@ COMP_RATIO: float = 10.0
 
 
 # --------------------------------------------------------------------------- #
-# 학습 구간 추출 (크로스페이드 버전)
+# 수동 리버브 파라미터 적용
 # --------------------------------------------------------------------------- #
-
-def extract_training_segments(
-    y: torch.Tensor,
-    sample_rate: int,
-    segment_len_sec: float = 5.0,
-    num_segments: int = 3,
-    crossfade_ms: float = 30.0,
-) -> torch.Tensor:
-    """RMS 상위 N개 블록을 크로스페이드로 이어붙여 대표 학습 구간을 만든다.
-
-    `legacy/ddsp.py` 의 `extract_active_segments` 는 블록을 그대로 concat 하는데, 시간적으로 떨어진
-    블록이 맞닿으면 경계에서 **없던 attack/decay 가 생긴다**. 이 파이프라인의 L_decay 는
-    바로 그 감쇠 기울기를 측정하므로 경계 아티팩트가 손실을 직접 오염시킨다.
-    여기서는 등파워 크로스페이드로 경계를 지운다.
-    """
-    block = int(segment_len_sec * sample_rate)
-    n = y.shape[0]
-    if n <= block:
-        return y
-
-    n_blocks = n // block
-    energies = []
-    for i in range(n_blocks):
-        seg = y[i * block : (i + 1) * block]
-        energies.append((float(torch.sqrt(torch.mean(seg**2) + 1e-8)), i))
-
-    energies.sort(key=lambda t: t[0], reverse=True)
-    picked = sorted(idx for _, idx in energies[: min(num_segments, n_blocks)])
-    blocks = [y[i * block : (i + 1) * block] for i in picked]
-
-    xf = int(crossfade_ms * 1e-3 * sample_rate)
-    if xf <= 0 or len(blocks) == 1:
-        return torch.cat(blocks)
-
-    # 등파워(sin/cos) 크로스페이드 — 합산 시 에너지가 보존되어 경계에 딥이 생기지 않는다
-    t = torch.linspace(0, 1, xf, device=y.device)
-    fade_in = torch.sin(0.5 * torch.pi * t)
-    fade_out = torch.cos(0.5 * torch.pi * t)
-
-    out = blocks[0]
-    for nxt in blocks[1:]:
-        head, tail = out[:-xf], out[-xf:]
-        joined = tail * fade_out + nxt[:xf] * fade_in
-        out = torch.cat([head, joined, nxt[xf:]])
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# 레퍼런스 리버브 파라미터 블라인드 추출
-# --------------------------------------------------------------------------- #
-
-def extract_reverb_params(
-    y: np.ndarray,
-    sample_rate: int = TARGET_SR,
-    hop_ms: float = 5.0,
-    min_decay_ms: float = 120.0,
-    onset_floor_db: float = -25.0,
-    smooth_ms: float = SMOOTH_MS,
-    rise_db: float = 3.0,
-    depth_db: float = 10.0,
-    drop_db: float = 6.0,
-) -> Dict:
-    """레퍼런스 보컬에서 RT60 과 Wet 을 **수치로만** 추출한다.
-
-    두 곡을 스펙트럼으로 비벼 비교하지 않는다. 곡이 다르면 가사·템포·음역이 전부
-    달라 신호 대조 자체가 의미가 없기 때문이다. 대신 레퍼런스의 **음절 사이 묵음
-    구간(speech pause)** 에서 잔향이 홀로 감쇠하는 구간을 찾아 스칼라 2개만 뽑고,
-    그 시점에서 레퍼런스의 역할은 끝난다.
-
-    검출
-        20 ms 안에 6 dB 이상 떨어지는 **급락 지점**을 오프셋으로 본다. 전체 피크
-        대비 고정 임계값을 쓰면 잔향이 긴 곡에서 테일이 임계 아래로 안 내려가
-        오프셋이 하나도 안 잡힌다(실측: RT60 2 s 에서 검출 0개).
-
-    RT60
-        감쇠 구간의 에너지 포락선(dB)에 직접 최소자승 회귀를 걸고 −60 dB 로 외삽한다.
-        −3 dB 아래부터 재서 직접음 잔재를 피하고, 10 dB 이상 감쇠한 구간만 채택한다.
-        구간마다 흔들리므로 **중앙값**으로 집계한다(이상치에 강함).
-        포락선은 중앙값 필터(10 ms)로 평활화한다 — 이동평균을 쓰면 오프셋 엣지가
-        뭉개져 리버브가 전혀 없는 드라이 신호에 감쇠 구간 22개를 오검출했다.
-
-    Wet
-        여기서는 뽑지 않는다. wet 은 `measure_decay_profile` 이 낸 감쇠 곡선을
-        타겟으로 `solve_wet_by_decay_profile` 이 내 보컬에서 역산한다.
-
-    검증(정답 알려진 리버브 5종, RT60 0.6~3.0 s): 평균 절대오차 **0.27 s**.
-    리버브가 없는 드라이 신호에서는 감쇠 구간 **0개**(오검출 없음).
-    실제 보컬 음원에서는 곡당 7개 내외의 감쇠 구간이 잡힌다.
-
-    Returns:
-        dict(rt60, n_segments, rt60_all)
-    """
-    hop = max(1, int(sample_rate * hop_ms * 1e-3))
-    win = hop * 2
-
-    x = np.asarray(y, dtype=np.float64)
-    if x.size < win * 4:
-        return {"rt60": 0.0, "wet": 0.0, "n_segments": 0, "rt60_all": [], "wet_all": []}
-
-    n_frames = (x.size - win) // hop + 1
-    idx = np.arange(win)[None, :] + hop * np.arange(n_frames)[:, None]
-    frames = x[idx]
-    energy = (frames**2).mean(axis=1)
-    env_db_raw = 10.0 * np.log10(energy + 1e-12)
-
-    # 검출·회귀 모두 **평활화된 포락선**으로 한다.
-    # 실제 보컬은 숨소리·자음·노이즈로 포락선이 프레임 단위로 출렁여서, 원본을 그대로
-    # 쓰면 "계속 하강" 조건이 즉시 깨진다(실측: 급락 후보 740개 중 채택 1개).
-    # **중앙값** 필터를 쓴다. 이동평균은 오프셋의 급격한 엣지를 뭉개서 없던 감쇠를
-    # 만들어내고, 실측에서 리버브가 전혀 없는 드라이 신호에 감쇠 구간 22개를
-    # 오검출했다. 중앙값은 스파이크만 제거하고 엣지는 보존한다.
-    from scipy.signal import medfilt
-    k = max(3, int(smooth_ms / hop_ms) | 1)
-    env_db = medfilt(env_db_raw, kernel_size=k)
-
-    peak_db = float(env_db.max())
-    min_frames = max(4, int(min_decay_ms / hop_ms))
-    drop_span = max(2, int(20.0 / hop_ms))  # 20 ms 안에 급락하면 오프셋으로 본다
-
-    # 오프셋 검출은 **급락 검출**로 한다.
-    # 절대 임계값(전체 피크 대비 −25 dB 등)을 쓰면 잔향이 긴 곡에서 테일이 임계 아래로
-    # 안 내려가 오프셋이 아예 안 잡힌다(실측: RT60 2 s 에서 검출 구간 0개).
-    rt60s, tail_ratios = [], []
-    i = drop_span
-    while i < n_frames - min_frames:
-        if env_db[i] < peak_db - 45.0:      # 노이즈 플로어 근처는 건너뜀
-            i += 1
-            continue
-        if env_db[i - drop_span] - env_db[i] < drop_db:   # 급락 아님
-            i += 1
-            continue
-
-        # 감쇠 구간: 다시 올라갈 때(=다음 음절 시작)까지
-        end = i
-        run_min = env_db[i]
-        while end < n_frames - 1:
-            run_min = min(run_min, env_db[end])
-            if env_db[end] > run_min + rise_db:
-                break
-            end += 1
-
-        if end - i >= min_frames:
-            # 감쇠 기울기는 **에너지 포락선에 직접** 회귀한다.
-            #
-            # Schroeder 역적분은 임펄스응답처럼 잔향이 끝까지 관측될 때만 무편향이다.
-            # 노래의 음절 간 묵음은 300~500 ms 뿐이라 적분이 중간에 잘리고, 잘린 끝
-            # 부근에서 EDC 가 급락해 기울기가 과대평가된다 → RT60 과소추정.
-            # 실측에서 정답 2.0 s 가 0.54 s 로 나왔고 오차가 RT60 에 비례해 커졌다.
-            # 포락선 직접 회귀는 이 절단 편향이 없다. 구간별로는 더 시끄럽지만
-            # 수십 개 구간의 중앙값을 쓰므로 잡음은 상쇄된다.
-            seg_db = env_db[i:end]
-            rel = seg_db - seg_db[0]
-            band = np.where(rel <= -3.0)[0]           # 직접음 잔재 회피
-            if band.size >= 3 and rel[band[-1]] <= -depth_db:
-                t = band * hop / sample_rate
-                slope = np.polyfit(t, rel[band], 1)[0]  # dB/s
-                if slope < -1e-3:
-                    rt60 = -60.0 / slope
-                    if 0.1 <= rt60 <= 6.0:
-                        rt60s.append(float(rt60))
-
-            # 잔향 레벨 지문: 오프셋 30 ms 뒤 테일 − 직전 지속 레벨 (dB)
-            tail_i = i + max(1, int(30.0 / hop_ms))
-            pre_lo = max(0, i - max(2, int(150.0 / hop_ms)))
-            if tail_i < end and i - pre_lo >= 2:
-                sustain_db = float(np.median(env_db[pre_lo:i]))
-                tail_ratios.append(float(env_db[tail_i] - sustain_db))
-
-        i = max(end, i + 1)
-
-    return {
-        "rt60": float(np.median(rt60s)) if rt60s else 0.0,
-        # tail_ratio 는 wet 을 직접 주지 않는다. 리버브 모델의 RIR 정규화 방식에
-        # 따라 같은 wet 이라도 테일 레벨이 달라지기 때문이다. 이 값은 '지문'으로
-        # 넘기고, 실제 wet 은 내 보컬에 모델을 적용해 이 지문을 재현하도록 역산한다.
-        "tail_ratio_db": float(np.median(tail_ratios)) if tail_ratios else None,
-        "n_segments": len(rt60s),
-        "rt60_all": rt60s,
-        "tail_all": tail_ratios,
-    }
-
-
-def _envelope_db(y, sample_rate=TARGET_SR, hop_ms=5.0, smooth_ms=SMOOTH_MS):
-    """평활화된 프레임 에너지 포락선(dB). 구간 검출과 동일한 규약."""
-    from scipy.signal import medfilt
-    hop = max(1, int(sample_rate * hop_ms * 1e-3))
-    win = hop * 2
-    x = np.asarray(y, dtype=np.float64)
-    n_frames = max(1, (x.size - win) // hop + 1)
-    idx = np.arange(win)[None, :] + hop * np.arange(n_frames)[:, None]
-    e = (x[idx] ** 2).mean(axis=1)
-    k = max(3, int(smooth_ms / hop_ms) | 1)
-    return medfilt(10.0 * np.log10(e + 1e-12), kernel_size=k)
-
-
-def _find_decay_segments(
-    y: np.ndarray,
-    sample_rate: int = TARGET_SR,
-    hop_ms: float = 5.0,
-    min_decay_ms: float = 120.0,
-    smooth_ms: float = SMOOTH_MS,
-    rise_db: float = 3.0,
-    drop_db: float = 6.0,
-    **_ignored,
-):
-    """음절이 끝나고 잔향만 남는 구간들을 찾는다.
-
-    반환: (env_db, hop, [(start, end), ...]) 또는 구간이 없으면 None.
-    RT60 추출과 감쇠 프로파일 측정이 **같은 구간 정의**를 쓰도록 공통화한 함수다.
-    """
-    hop = max(1, int(sample_rate * hop_ms * 1e-3))
-    win = hop * 2
-    x = np.asarray(y, dtype=np.float64)
-    if x.size < win * 4:
-        return None
-
-    n_frames = (x.size - win) // hop + 1
-    idx = np.arange(win)[None, :] + hop * np.arange(n_frames)[:, None]
-    energy = (x[idx] ** 2).mean(axis=1)
-    env_db_raw = 10.0 * np.log10(energy + 1e-12)
-
-    # 중앙값 필터: 이동평균은 오프셋 엣지를 뭉개서 리버브가 없는 드라이 신호에도
-    # 감쇠 구간을 만들어낸다(실측 오검출 22개). 중앙값은 엣지를 보존한다.
-    from scipy.signal import medfilt
-    k = max(3, int(smooth_ms / hop_ms) | 1)
-    env_db = medfilt(env_db_raw, kernel_size=k)
-
-    peak_db = float(env_db.max())
-    min_frames = max(4, int(min_decay_ms / hop_ms))
-    drop_span = max(2, int(20.0 / hop_ms))
-
-    out = []
-    i = drop_span
-    while i < n_frames - min_frames:
-        if env_db[i] < peak_db - 45.0 or env_db[i - drop_span] - env_db[i] < drop_db:
-            i += 1
-            continue
-        end = i
-        run_min = env_db[i]
-        while end < n_frames - 1:
-            run_min = min(run_min, env_db[end])
-            if env_db[end] > run_min + rise_db:
-                break
-            end += 1
-        if end - i >= min_frames:
-            out.append((i, end))
-        i = max(end, i + 1)
-
-    return (env_db, hop, out) if out else None
-
 
 def set_reverb_params(reverb: nn.Module, rt60: float, wet: float) -> None:
     """스칼라 rt60/wet 을 DifferentiableReverb 의 노브에 그대로 꽂는다.
@@ -425,157 +102,6 @@ def set_reverb_params(reverb: nn.Module, rt60: float, wet: float) -> None:
         reverb.raw_rt60.fill_(_logit(rt60, rt_lo, rt_hi))
         reverb.raw_wet.fill_(_logit(wet, 0.0, wet_max))
 
-
-DECAY_LAGS_MS = (20.0, 40.0, 60.0, 90.0, 120.0, 160.0, 200.0, 260.0)
-
-
-def measure_decay_profile(
-    y: np.ndarray,
-    sample_rate: int = TARGET_SR,
-    hop_ms: float = 5.0,
-    lags_ms=DECAY_LAGS_MS,
-    segments=None,
-    drop_db: float = 4.0,
-    **kw,
-) -> Optional[np.ndarray]:
-    """음절이 끝나는 지점들의 **감쇠 곡선 프로파일**을 낸다. [len(lags_ms)] (dB)
-
-    각 오프셋마다 직전 지속 레벨을 기준(0 dB)으로 잡고, 오프셋 이후 여러 지연
-    시점에서의 상대 레벨을 읽는다. 구간별 곡선을 **중앙값**으로 합쳐 하나의
-    대표 곡선을 만든다.
-
-    한 점(예: 30 ms)만 재던 이전 방식은 숨소리·자음에 흔들려 wet 역산이 불안정했다
-    (합성 검증에서 정답 0.15 에 0.60 이 나오는 식). 곡선 전체를 쓰면 rt60 이 이미
-    맞춰진 상태에서 **곡선의 세로 위치**만 wet 에 따라 움직이므로 훨씬 안정적이다.
-
-    Returns:
-        프로파일 배열, 또는 감쇠 구간을 못 찾으면 None.
-    """
-    # `segments` 를 주면 그 위치에서만 잰다.
-    #
-    # 자기 자신에서 오프셋을 검출하면 **측정하려는 값이 검출 감도를 좌우한다**:
-    # wet 이 커질수록 잔향이 음절 사이를 메워 급락이 사라지고, 오프셋이 아예
-    # 안 잡혀 프로파일이 None 이 된다(실측: wet 0.25 이상에서 검출 실패).
-    # 내 보컬은 드라이 신호를 갖고 있으므로 **드라이에서 오프셋을 확정**하고
-    # 그 자리에서 wet 신호를 재면 이 순환이 끊긴다.
-    if segments is not None:
-        env_db, hop, offsets = segments
-        prof_env = _envelope_db(y, sample_rate, hop_ms, kw.get("smooth_ms", SMOOTH_MS))
-        n = min(env_db.size, prof_env.size)
-        env_db, prof_env = env_db[:n], prof_env[:n]
-        env_db = prof_env  # 위치는 드라이 기준, 레벨은 측정 대상 신호에서 읽는다
-    else:
-        segs = _find_decay_segments(y, sample_rate, hop_ms, drop_db=drop_db, **kw)
-        if not segs:
-            return None
-        env_db, hop, offsets = segs
-    lag_frames = [max(1, int(round(l / hop_ms))) for l in lags_ms]
-    pre_frames = max(2, int(round(150.0 / hop_ms)))
-
-    rows = []
-    for off, end in offsets:
-        lo = max(0, off - pre_frames)
-        if off - lo < 2:
-            continue
-        sustain = float(np.median(env_db[lo:off]))
-        row = []
-        ok = True
-        for lf in lag_frames:
-            j = off + lf
-            if j >= end or j >= env_db.size:
-                ok = False
-                break
-            row.append(float(env_db[j] - sustain))
-        if ok:
-            rows.append(row)
-
-    if not rows:
-        return None
-    return np.median(np.asarray(rows), axis=0)
-
-
-def solve_wet_for_tail_ratio(
-    reverb: nn.Module,
-    x: torch.Tensor,
-    rt60: float,
-    target_tail_db: float,
-    sample_rate: int = TARGET_SR,
-    iters: int = 18,
-) -> float:
-    """테일 지문(오프셋 30 ms 뒤 잔향 − 직전 지속 레벨, dB) 하나로 wet 을 역산한다.
-
-    `solve_wet_by_decay_profile` 의 단순 버전. 측정점이 하나뿐이라 잡음에 약하지만,
-    감쇠 프로파일 전체를 잡지 못하는 음원에서는 이쪽이 값을 내주기도 한다.
-    """
-    lo, hi = 0.0, 0.69
-    best, best_err = 0.0, float("inf")
-    for _ in range(iters):
-        mid = 0.5 * (lo + hi)
-        set_reverb_params(reverb, rt60, mid)
-        with torch.no_grad():
-            wet_sig = reverb(x)[..., : x.shape[-1]].mean(0).cpu().numpy()
-        meas = extract_reverb_params(wet_sig, sample_rate).get("tail_ratio_db")
-        if meas is None:
-            break
-        err = abs(meas - target_tail_db)
-        if err < best_err:
-            best, best_err = mid, err
-        if meas < target_tail_db:
-            lo = mid
-        else:
-            hi = mid
-    return best
-
-
-def solve_wet_by_decay_profile(
-    reverb: nn.Module,
-    x: torch.Tensor,
-    rt60: float,
-    target_profile: np.ndarray,
-    sample_rate: int = TARGET_SR,
-    coarse: int = 12,
-    refine: int = 7,
-) -> float:
-    """내 보컬의 감쇠 프로파일이 레퍼런스와 일치하도록 wet 을 찾는다.
-
-    RT60 은 이미 이식돼 고정이므로 감쇠 **기울기**는 맞춰져 있다. 남은 자유도는
-    오프셋 직후 잔향이 얼마나 높이 남느냐 = 곡선의 세로 위치이고, 그게 곧 wet 이다.
-    따라서 레퍼런스에서 잰 프로파일을 타겟으로, 내 보컬에 같은 리버브를 걸었을 때
-    같은 프로파일이 나오는 wet 을 찾는다.
-
-    이분 탐색 대신 **거친 격자 → 국소 정밀 격자** 2단으로 간다. 프로파일 오차가
-    wet 에 대해 항상 단조롭지는 않아서(측정 잡음) 이분 탐색은 국소해에 빠질 수 있다.
-    """
-    # 오프셋 위치는 **드라이 신호에서 한 번만** 확정한다(위 주석 참조).
-    dry_segments = _find_decay_segments(x.detach().cpu().numpy(), sample_rate)
-    if dry_segments is None:
-        return 0.0
-
-    if target_profile is None or len(target_profile) == 0:
-        return 0.0
-
-    def _err(w: float) -> float:
-        set_reverb_params(reverb, rt60, w)
-        with torch.no_grad():
-            sig = reverb(x)[..., : x.shape[-1]].mean(0).cpu().numpy()
-        prof = measure_decay_profile(sig, sample_rate, segments=dry_segments)
-        if prof is None:
-            return float("inf")
-        n = min(len(prof), len(target_profile))
-        return float(np.abs(prof[:n] - target_profile[:n]).mean())
-
-    grid = np.linspace(0.0, 0.69, coarse)
-    errs = [_err(float(w)) for w in grid]
-    k = int(np.argmin(errs))
-    if not np.isfinite(errs[k]):
-        return 0.0
-
-    step = grid[1] - grid[0]
-    lo = max(0.0, grid[k] - step)
-    hi = min(0.69, grid[k] + step)
-    fine = np.linspace(lo, hi, refine)
-    fine_errs = [_err(float(w)) for w in fine]
-    return float(fine[int(np.argmin(fine_errs))])
 
 
 # --------------------------------------------------------------------------- #
@@ -745,13 +271,10 @@ class E2EChain(nn.Module):
 
         return (y_eq, y) if return_stages else y
 
-    def apply_reverb(
-        self, y_dry: torch.Tensor, reverb_amount: float = 1.0
-    ) -> torch.Tensor:
+    def apply_reverb(self, y_dry: torch.Tensor) -> torch.Tensor:
         """드라이 모노 [T] → 리버브 통과 스테레오 [2, T]. 리버브 off 면 dry 를 복제한다.
 
-        **그래프를 끊지 않는다.** 렌더(`forward`)와 학습 루프(`LOSS_MEASURE_POINT
-        == "post_reverb"`)가 이 함수를 공유해야 "손실이 듣는 소리 = 저장되는 소리"가
+        **그래프를 끊지 않는다.** 렌더(`forward`)와 학습 루프(`리버브 이후`)가 이 함수를 공유해야 "손실이 듣는 소리 = 저장되는 소리"가
         정의상 보장된다. 그래디언트를 끊고 싶은 쪽(`L_decay` 입력)은 호출부에서
         `torch.no_grad()` 로 감싼다 — 여기서 끊으면 안 된다.
         """
@@ -760,32 +283,17 @@ class E2EChain(nn.Module):
         if "reverb" not in self.active:
             return torch.stack([y_dry, y_dry], dim=0)
 
-        if isinstance(self.reverb, MeasuredIRReverb):
-            # 측정 IR 은 센드 구조다. 드라이는 IR 을 통과하지 않고, 잔향만 더해진다.
-            # 슬라이더는 그 센드량으로 들어간다 — 출력단에서 dry 를 재블렌드하면
-            # 안 된다(직접음 이중 합산 → 2.5 ms 어긋남 → 400 Hz 간격 콤필터).
-            return self.reverb(y_dry, reverb_amount)[..., :length]
-
-        y_wet = self.reverb(y_dry)  # [2, T + ir]
-        y_wet = y_wet[..., :length]
-
-        if reverb_amount != 1.0:
-            # 합성 리버브는 내부에서 wet 을 이미 섞으므로, 사용자 슬라이더는
-            # dry 와의 재블렌드로 반영한다 (wet=0 → 완전 dry).
-            dry2 = torch.stack([y_dry, y_dry], dim=0)
-            y_wet = dry2 + reverb_amount * (y_wet - dry2)
-        return y_wet
+        return self.reverb(y_dry)[..., :length]
 
     def forward(
         self,
         x: torch.Tensor,
         eq_amount: float = 1.0,
         comp_amount: float = 1.0,
-        reverb_amount: float = 1.0,
     ) -> torch.Tensor:
         """전체 체인. 반환 [2, T] 스테레오 (리버브 off 면 dry 를 복제)."""
         y_dry = self.to_dry(x, eq_amount, comp_amount)
-        return self.apply_reverb(y_dry, reverb_amount)
+        return self.apply_reverb(y_dry)
 
 
 # --------------------------------------------------------------------------- #
@@ -810,9 +318,6 @@ def match_e2e(
     raw_path: str,
     ref_path: str,
     out_path: str,
-    ir_source: str = "instrumental",
-    # "measured"(Rec-RIR 측정 IR) / "synth"(레퍼런스에서 추출 후 wet 학습) / "manual"(사용자 지정)
-    reverb_mode: str = "measured",
     manual_rt60: float = 1.0,
     manual_wet: float = 0.3,
     inst_path: Optional[str] = None,
@@ -821,7 +326,6 @@ def match_e2e(
     match_volume: bool = False,
     gain_scale_db: float = 15.0,
     comp_amount: float = 1.0,
-    reverb_amount: float = 1.0,
     mode: str = "both",
     # --- E2E 전용 ---
     n_steps: int = 50,
@@ -830,7 +334,6 @@ def match_e2e(
     comp_ratio: float = COMP_RATIO,
     lr_eq: float = 0.05,
     lr_comp: float = 0.05,
-    lr_reverb: float = 0.05,
     eq_l2: float = 0.1,
     eq_smooth: float = 0.1,
     comp_thresh_weight: float = 0.0,
@@ -842,7 +345,7 @@ def match_e2e(
     손실은 **모듈별로 분리**되어 있다(`losses.DSPMatchingLoss` 참조). 가중합이 아니므로
     w_tone/w_dyn 같은 항 가중치는 없고, 모듈별 학습률(`lr_eq`/`lr_comp`)이 그 역할을 한다.
 
-    반환 dict 는 `legacy/ddsp.py` 의 `match_eq` 와 키 호환이므로 `main.py` 에서 바로 교체 가능하다.
+    반환 dict 는 이전 파이프라인 의 `match_eq` 와 키 호환이므로 `main.py` 에서 바로 교체 가능하다.
 
     Args:
         n_steps:          조인트 최적화 스텝 수. M1 CPU 기준 약 180 ms/step.
@@ -886,15 +389,6 @@ def match_e2e(
     if max_gain_db is not None:
         gain_scale_db = max_gain_db
 
-    manual_reverb = reverb_mode == "manual"
-    if manual_reverb:
-        # 수동 모드에서는 wet 노브가 곧 사용자 값이므로 렌더 단계의 재블렌드
-        # (reverb_amount)를 1.0 으로 고정한다. 그대로 두면 wet 스케일러가 두 개가 되어
-        # 화면에 찍히는 wet 과 실제로 들리는 잔향량이 어긋난다.
-        if verbose and reverb_amount != 1.0:
-            print(f"[E2E] 수동 리버브 → reverb_amount {reverb_amount:.2f} 무시하고 1.0 사용")
-        reverb_amount = 1.0
-
     chain = E2EChain(
         sample_rate=TARGET_SR,
         n_fft=N_FFT,
@@ -905,162 +399,30 @@ def match_e2e(
         release_ms=release_ms,
         comp_ratio=comp_ratio,
         active_modes=active_modes,
-        # 수동 모드만 wet 1.0 까지 허용한다(학습 경로는 0.7 로 묶어 과도한 wet 을 막는다).
-        reverb_wet_max=1.0 if manual_reverb else 0.7,
+        reverb_wet_max=1.0,
     )
 
-    # ---------------- 리버브: 레퍼런스에서 IR 추정 → 이식 ----------------
-    # 곡이 다르면 스펙트럼 대조가 의미 없으므로 리버브는 **학습하지 않는다**.
-    # 레퍼런스에서 IR 을 추정하는 시점에 레퍼런스의 역할은 끝난다. 추정한 IR 을 내
-    # 보컬에 컨볼브하기만 한다.
-    reverb_info = {"rt60": 0.0, "wet": 0.0, "n_segments": 0}
-    if "reverb" in active_modes and manual_reverb:
-        # ---------------- 수동 모드 ----------------
-        # 사용자가 RT60 과 wet 을 직접 지정한다. 레퍼런스에서 아무것도 추정하지 않으므로
-        # Rec-RIR 추론(최초 약 60초)도, 감쇠 구간 검출도 돌지 않는다. 학습도 없다.
-        rt_lo = DifferentiableReverb.RT60_MIN
-        rt_hi = DifferentiableReverb.RT60_MAX
-        rt60_use = float(np.clip(manual_rt60, rt_lo, rt_hi))
+    # 수동 리버브: RT60과 wet은 사용자가 지정하며 추정이나 학습을 하지 않는다.
+    if "reverb" in active_modes:
+        rt60_use = float(np.clip(manual_rt60, DifferentiableReverb.RT60_MIN, DifferentiableReverb.RT60_MAX))
         wet_use = float(np.clip(manual_wet, 0.0, chain.reverb.wet_max))
-        if verbose and (rt60_use != manual_rt60 or wet_use != manual_wet):
-            print(f"[E2E] 수동 값 클립: rt60 {manual_rt60}→{rt60_use}, wet {manual_wet}→{wet_use}")
         set_reverb_params(chain.reverb, rt60_use, wet_use)
-        with torch.no_grad():
-            rt_set, wet_set = chain.reverb.get_params()
-        reverb_info = {
-            "rt60": float(rt_set),
-            "wet": float(wet_set),
-            "n_segments": 0,
-            "reverb_mode": "manual",
-            "ir_source": None,
-            "manual": True,
-        }
         if verbose:
-            print(f"[E2E] 수동 리버브: RT60={float(rt_set):.2f}s  wet={float(wet_set)*100:.0f}%")
-
-    elif "reverb" in active_modes:
-        # 잔향을 어디서 잴지 선택한다.
-        #
-        # "instrumental" — 반주 트랙에서 추정. Demucs 를 안 거쳐 아티팩트가 없고,
-        #     음악적으로도 내 보컬이 앉을 공간은 반주의 공간이다.
-        # "reference"    — 레퍼런스 보컬에서 추정. Rec-RIR 은 speech 로 학습된
-        #     모델이라 도메인상 이쪽이 안쪽이다. 다만 Demucs 분리 잔여물(고역
-        #     쉬쉬거림)이 묵음에 남아 잔향으로 오인될 위험은 남는다.
-        ir_ref = y_ref
-        if ir_source == "instrumental" and inst_path:
-            try:
-                y_inst, _ = librosa.load(inst_path, sr=TARGET_SR, mono=True)
-                ir_ref = y_inst
-                if verbose:
-                    print(f"[E2E] 잔향 측정 대상: 반주 ({os.path.basename(inst_path)})")
-            except Exception as e:
-                if verbose:
-                    print(f"[E2E] 반주 로드 실패({e}) → 레퍼런스에서 측정")
-        elif verbose:
-            print("[E2E] 잔향 측정 대상: 레퍼런스 보컬")
-
-        # reverb_mode="measured": Rec-RIR 이 추정한 IR 을 그대로 컨볼브한다.
-        # 지수감쇠 합성은 모양이 하나로 강제돼 대역별 감쇠·초기반사를 표현하지 못한다.
-        if reverb_mode == "measured":
-            # Rec-RIR 은 여기서만 임포트한다. 최상단에서 임포트하면 그 의존성
-            # (toml / einops / mamba_ssm)이 없을 때 pipeline 모듈 자체가 로드되지
-            # 않아, 리버브를 안 쓰는 EQ·컴프 작업까지 통째로 죽는다.
-            from recrir_ir import estimate_ir
-
-            # 분석 구간 5초. 16 kHz 추론이 M1 CPU 에서 약 60초 걸린다.
-            est = estimate_ir(
-                ir_ref, TARGET_SR, target_sr=TARGET_SR,
-                analysis_seconds=5.0, verbose=verbose,
-            )
-            if est is not None:
-                chain.reverb = MeasuredIRReverb(est["ir"], sample_rate=TARGET_SR)
-                chain.reverb._rt60_info = est["rt60"]
-                reverb_info = {
-                    "rt60": est["rt60"],
-                    "wet": 1.0,          # IR 의 DRR 이 잔향량을 결정한다. 믹싱 없음.
-                    "n_segments": 0,     # Rec-RIR 은 감쇠구간 검출을 쓰지 않는다
-                    "ir_source": ir_source,
-                    "reverb_mode": "measured",
-                    # 추정된 IR 자체의 음향 지표. 전부 IR 배열에서 바로 계산한 값이다.
-                    "ir_engine": "rec-rir",
-                    "ir_ms": est["ir_ms"],
-                    "analysis_start_s": est["analysis_start_s"],
-                    "edt": est["edt"],
-                    "drr_db": est["drr_db"],
-                    "c80_db": est["c80_db"],
-                    "rt60_low": est["rt60_low"],
-                    "rt60_mid": est["rt60_mid"],
-                    "rt60_high": est["rt60_high"],
-                    "hf_lf_ratio": est["hf_lf_ratio"],
-                }
-                if verbose:
-                    print(f"[E2E] Rec-RIR IR 사용: {est['ir_ms']:.0f}ms, "
-                          f"RT60 {est['rt60']:.2f}s (분석 {est['analysis_start_s']:.1f}s~)")
-            else:
-                active_modes = [m for m in active_modes if m != "reverb"]
-                chain.active.discard("reverb")
-                if verbose:
-                    print("[E2E] Rec-RIR IR 추정 실패 → 리버브 비활성")
-
-        elif (ext := extract_reverb_params(ir_ref, TARGET_SR))["n_segments"] > 0 and ext["rt60"] > 0.0:
-            wet_solved = 0.0
-            probe = x_train if x_train.shape[0] > 0 else t_raw
-            # 1순위: 테일 지문 역산. 실제 음원에서 안정적으로 값을 낸다.
-            if ext.get("tail_ratio_db") is not None:
-                wet_solved = solve_wet_for_tail_ratio(
-                    chain.reverb, probe, ext["rt60"], ext["tail_ratio_db"], TARGET_SR
-                )
-            # 2순위: 감쇠 프로파일 역산. 합성 검증 정확도는 더 높지만(MAE 0.061),
-            # 실제 음원에서 0 으로 떨어지는 경우가 있어 폴백으로만 쓴다.
-            if wet_solved <= 0.0:
-                target_profile = measure_decay_profile(ir_ref, TARGET_SR)
-                if target_profile is not None:
-                    wet_solved = solve_wet_by_decay_profile(
-                        chain.reverb, probe, ext["rt60"], target_profile, TARGET_SR
-                    )
-            set_reverb_params(chain.reverb, ext["rt60"], wet_solved)
-            reverb_info = {"rt60": ext["rt60"], "wet": wet_solved,
-                           "n_segments": ext["n_segments"], "ir_source": ir_source,
-                           "tail_ratio_db": ext.get("tail_ratio_db")}
-            if verbose:
-                print(f"[E2E] 레퍼런스 리버브 추출: RT60={ext['rt60']:.2f}s  "
-                      f"wet={wet_solved:.3f}  (감쇠구간 {ext['n_segments']}개)")
-        elif reverb_mode != "measured":
-            active_modes = [m for m in active_modes if m != "reverb"]
-            chain.active.discard("reverb")
-            if verbose:
-                print("[E2E] 감쇠 구간을 못 찾음 → 리버브 비활성")
-    # 리버브에는 **학습 파라미터가 없다** (Rec-RIR IR 을 쓰는 measured 모드).
-    #
-    # IR 이 직접음·초기반사·테일을 모두 담고 있고 그 비율(DRR)이 곧 레퍼런스 공간이다.
-    # 조절할 스칼라가 없으니 rt60 도 wet 도 학습 대상이 아니다. 부수 효과로 rt60 ↔ wet
-    # 축퇴("rt60↑+wet↓" 와 "rt60↓+wet↑" 가 EDC 기울기에 거의 같은 효과)가 사라진다.
-    #
-    # 합성 리버브(reverb_mode == "synth")에서는 종전대로 wet 만 학습한다.
-    # 수동 모드는 사용자가 값을 정했으므로 학습하지 않는다 — 학습하면 지정한 값이 덮인다.
-    reverb_trainable = (
-        "reverb" in active_modes
-        and not manual_reverb
-        and not isinstance(chain.reverb, MeasuredIRReverb)
-    )
-    chain.reverb.raw_rt60.requires_grad_(False)      # 추출값/지정값 고정
-    chain.reverb.raw_wet.requires_grad_(reverb_trainable)
-
+            print(f"[E2E] 수동 리버브: RT60={rt60_use:.2f}s wet={wet_use*100:.0f}%")
+    chain.reverb.raw_rt60.requires_grad_(False)
+    chain.reverb.raw_wet.requires_grad_(False)
     # 어떤 손실을 계산할지. 침범 방지는 이제 detach 가 구조적으로 보장하므로, 이 스위치는
     # **순수하게 연산을 아끼기 위한 것**이다 — 움직일 파라미터가 없는 손실은 값도 그래디언트도
     # 쓸 데가 없다. (L_dyn 은 K-weighting IIR 2회 + 4배 리샘플로 곡 전체 기준 스텝당 1.5 초다.)
     train_tone = "eq" in active_modes
     train_dyn = "comp" in active_modes
-    train_decay = reverb_trainable
 
     # 톤/다이내믹 손실을 리버브 뒤에서 잴지. 리버브가 꺼져 있으면 앞뒤가 같으므로 무의미하다.
     measure_post_reverb = (
-        LOSS_MEASURE_POINT == "post_reverb" and "reverb" in chain.active
+        "reverb" in chain.active
     )
     if verbose and measure_post_reverb:
         print("[E2E] 손실 측정 지점: 리버브 **이후** (EQ·컴프 그래디언트가 리버브를 관통)")
-    if verbose and "reverb" in active_modes and not reverb_trainable:
-        print("[E2E] 리버브 학습 파라미터 없음 → L_decay 계산 생략")
     if verbose and not train_dyn:
         print("[E2E] 컴프 비활성 → L_dyn 계산 생략")
 
@@ -1084,16 +446,10 @@ def match_e2e(
         groups.append({"params": chain.eq.parameters(), "lr": lr_eq})
     if "comp" in active_modes:
         groups.append({"params": chain.comp.parameters(), "lr": lr_comp})
-    if reverb_trainable:
-        # 합성 리버브 폴백에서만. rt60 은 고정이므로 wet 만 옵티마이저에 넣는다.
-        # Rec-RIR IR 모드에서는 리버브가 옵티마이저에 아예 들어가지 않는다 — 다만
-        # forward 그래프에는 그대로 남아, EQ·컴프의 그래디언트가 리버브를 통과한다.
-        # 그래야 EQ 가 "잔향 테일이 더해질 것"을 알고 최적화된다(losses.py 의 p_out 주석).
-        groups.append({"params": [chain.reverb.raw_wet], "lr": lr_reverb})
 
     target = r_train.view(1, 1, -1)  # [B=1, C=1, T]
 
-    # ---------------- 컴프 학습 구간: 각자의 '가장 큰 15초' ----------------
+    # ---------------- 컴프 학습 구간: 각자의 하이라이트 (기본 10초) ----------------
     # threshold 는 큰 대목에서 얼마나 눌리는지로 결정되고, BS.1770 게이팅이 조용한 구간을
     # 어차피 빼버린다. 그래서 곡 전체를 돌릴 필요가 없다.
     #
@@ -1128,63 +484,39 @@ def match_e2e(
         for step in range(n_steps):
             optimizer.zero_grad()
 
-            # 측정 지점과 그래디언트 경로는 LOSS_GRAD_MODE 가 정한다(상수 주석 참조).
-            #
-            # "selective": 두 손실이 **같은 소리**(컴프 통과 후)를 듣되 경로는 갈라 둔다.
-            #     sg 는 forward 값을 바꾸지 않으므로 tone_src·dyn_src·최종 출력이 수치적으로
-            #     같고, 그래디언트만 각자 자기 모듈로 간다. 컴프를 두 번 통과시키는데,
-            #     다이내믹 쪽은 하이라이트 구간만이라 비용이 작다.
+            # 각 손실은 최종 신호를 기준으로 계산하고 그래디언트를 해당 모듈로만 보낸다.
             y_eq = chain.eq_output(x_train)
             has_comp = "comp" in chain.active
-            dyn_presliced = False   # split 모드만 컴프 **이전**에 자른다
 
             if not has_comp:
                 tone_src = dyn_full = y_eq
-            elif LOSS_GRAD_MODE == "split":
-                # 톤은 컴프 이전에서 잰다(컴프의 스펙트럼 변화를 EQ 가 보지 못함)
-                tone_src = y_eq
-                dyn_in = y_eq.detach()
-                if comp_window is not None:
-                    dyn_in = dyn_in[comp_window[0]:comp_window[1]]
-                    dyn_presliced = True
-                dyn_full = chain.comp(dyn_in)
-            elif LOSS_GRAD_MODE == "unified":
-                # 완전 결합: 하나의 그래프를 두 손실이 공유한다
-                tone_src = dyn_full = chain.comp(y_eq)
-            else:  # "selective" (기본)
-                # 톤: 컴프를 통과시키되 threshold 를 상수로 고정 → θ 로만 흐른다
+            else:
+                # 톤 손실은 컴프 설정을 고정하고 EQ로, 다이내믹 손실은 EQ 출력을 고정하고 컴프로 보낸다.
                 tone_src = chain.comp(y_eq, detach_params=True)
-                # 다이내믹: 컴프 입력을 고정 → θ_T 로만 흐른다.
-                #
-                # 컴프는 **곡 전체**에 걸고 출력을 잘라 쓴다. 구간을 먼저 잘라 넣으면
-                # 같은 값이 나오지 않는다 — 밸리스틱 재귀가 구간 시작에서 상태 0 으로
-                # 리셋되고, 오토 메이크업이 구간 평균 GR 로 계산돼 상수 오프셋이 달라진다
-                # (실측 차이 6.7e-2). 그러면 "두 손실이 같은 소리를 듣는다"가 깨진다.
                 dyn_full = chain.comp(y_eq.detach())
 
-            # --- 측정 지점: 리버브 뒤로 옮긴다 (LOSS_MEASURE_POINT) ---
+            # 손실은 리버브 출력에서 측정한다.
             #
             # 여기는 **그래프를 끊지 않는다.** EQ·컴프의 그래디언트가 리버브 컨볼루션을
             # 관통해서 흘러야 "최종 출력 기준으로 EQ·컴프를 고른다"가 성립한다.
-            # 아래 L_decay 의 no_grad 블록과는 목적도 경로도 별개다.
             #
             # 손실은 모노에서 계산하고 최종 지표도 `y_processed.mean(axis=0)` 로 재므로
             # 여기서도 채널 평균으로 내린다(측정 IR 은 좌우가 동일해 평균이 곧 원신호).
             if measure_post_reverb:
                 shared = tone_src is dyn_full
-                tone_src = chain.apply_reverb(tone_src, reverb_amount).mean(dim=0)
+                tone_src = chain.apply_reverb(tone_src).mean(dim=0)
                 dyn_full = (tone_src if shared
-                            else chain.apply_reverb(dyn_full, reverb_amount).mean(dim=0))
+                            else chain.apply_reverb(dyn_full).mean(dim=0))
 
             # 자르기는 **리버브 뒤**다. 구간을 먼저 자르고 리버브를 걸면 구간 시작 앞쪽
             # 신호가 만들어 낸 잔향이 통째로 빠져(테일 유입 없음) 구간 앞부분이 실제
             # 출력보다 드라이해진다 — 컴프의 밸리스틱과 같은 이유다.
-            dyn_src = (dyn_full if (comp_window is None or dyn_presliced)
+            dyn_src = (dyn_full if comp_window is None
                        else dyn_full[comp_window[0]:comp_window[1]])
 
             # 그래프를 공유하는 것은 "unified" 뿐이다. 나머지는 tone/dyn 이 서로 다른
             # 그래프라 첫 backward 가 그래프를 해제해도 두 번째가 살아 있다.
-            retain = (LOSS_GRAD_MODE == "unified") and has_comp and train_tone and train_dyn
+            retain = False
 
             d: Dict = {}
 
@@ -1219,21 +551,6 @@ def match_e2e(
                 d.update(d_dyn)
                 l_dyn.backward()
 
-            # --- 리버브 쪽 (합성 리버브 폴백에서만 학습 파라미터가 있다) ---
-            # 리버브 입력은 항상 끊는다 → L_decay 의 그래디언트가 EQ·컴프로 새지 않는다.
-            # (통합 경로에서도 이 분리는 유지한다 — 리버브는 이번 변경 범위 밖이다.)
-            if train_decay:
-                # 리버브 입력 = 곡 전체 드라이 체인 출력. 어차피 끊어 쓰므로 no_grad 로 만든다
-                # (모드마다 tone_src/dyn_src 의 길이·경로가 달라 재사용하지 않는다).
-                with torch.no_grad():
-                    y_dry_full = chain.comp(y_eq.detach()) if has_comp else y_eq.detach()
-                y_rev = chain.reverb(y_dry_full)[..., : y_dry_full.shape[-1]]
-                l_decay, d_decay = criterion.decay_loss(
-                    y_rev.unsqueeze(0), target, sample_rate=TARGET_SR
-                )
-                d.update(d_decay)
-                l_decay.backward()
-
             # 파라미터 집합이 겹치지 않으므로 backward 들의 그래디언트가 섞이지 않는다.
             # 따라서 단일 Adam 에 param group 으로 넣은 것이 옵티마이저 여러 개와 동일하다.
             optimizer.step()
@@ -1265,7 +582,6 @@ def match_e2e(
             t_raw,
             eq_amount=match_amount,
             comp_amount=comp_amount,
-            reverb_amount=reverb_amount,
         )  # [2, T]
 
         if match_volume:
@@ -1349,12 +665,9 @@ def match_e2e(
     last = dict(history[-1]) if history else {"L_tone_raw": 0.0, "L_dyn_raw": 0.0, "L_decay_raw": 0.0}
     last.update({k: report_losses[k] for k in ("L_tone_raw", "L_dyn_raw", "L_decay_raw")})
 
-    # --- UI 지표: 다이내믹 레인지(기본 크레스트 팩터, `DYN_METRIC`) ---
-    # 손실이 실제로 최적화하는 양을 그대로 표시한다. 이전에는 legacy 엔진의
-    # '음절 피크 편차'를 표시했는데, L_dyn 이 재는 양과 달라서 컴프가 제대로
-    # 동작해도 화면 수치가 안 움직이는(혹은 반대로 가는) 혼란이 있었다.
+    # --- UI 지표: 다이내믹 레인지(기본 크레스트 팩터, 고정된 크레스트 팩터) ---
     #
-    # **측정 구간은 학습 구간과 같아야 한다.** 하이라이트 15초로 학습하고 곡 전체로
+    # **측정 구간은 학습 구간과 같아야 한다.** 하이라이트로 학습하고 곡 전체로
     # 채점하면 서로 다른 축을 비교하는 것이 된다 — 구간 통계라 구간을 바꾸면
     # 값이 이동하고, 그 이동량은 신호마다 다르다. 그래서 comp_window 가 있으면 지표도
     # 같은 구간에서 잰다. 곡 전체 값은 참고용으로 따로 남긴다.
@@ -1397,7 +710,7 @@ def match_e2e(
             _, gr_traj = chain.comp(y_probe, return_gain_reduction=True)
             gr_max_db = float(gr_traj.min())  # GR 은 음수 → 최댓값은 최솟값
 
-    # 크레스트 팩터는 항상 0 이상이라(피크 ≥ RMS) PLR 시절의 "ref ≤ 0 이면 대체" 예외가
+    # 크레스트 팩터는 항상 0 이상이라(피크 ≥ RMS) 예외적인 음수 값 대체가
     # 필요 없다. 지표가 하나로 통일됐다.
     dyn_mae = abs(shaped_var - ref_var)
     combined_mae = 0.65 * tonal_mae + 0.35 * dyn_mae
@@ -1471,39 +784,17 @@ def match_e2e(
             "lufs_raw": round(lufs_raw, 2),
             "lufs_ref": round(lufs_ref, 2),
             "lufs_proc": round(lufs_proc, 2),
-            "metric": ("Crest Factor (True Peak dBTP - RMS dB)"
-                       if criterion.DYN_METRIC == "crest"
-                       else "PLR (True Peak dBTP - Integrated LUFS)"),
-            "dyn_metric": criterion.DYN_METRIC,
+            "metric": "Crest Factor (True Peak dBTP - RMS dB)",
+            "dyn_metric": "crest",
         },
         "reverb_data": {
             "rt60": float(rt60) if reverb_active else 0.0,
-            # 측정 IR 은 센드량, 합성 리버브는 dry/wet 블렌드 — 어느 쪽이든
-            # 슬라이더가 실제 잔향량에 곱해진다.
-            "wet": float(wet) * reverb_amount if reverb_active else 0.0,
-            # RT60 은 레퍼런스에서 추출해 고정, wet 은 추출값을 초기값으로 학습
-            # (수동 모드에서는 둘 다 사용자 지정값이고 학습은 없다)
-            "rt60_extracted": reverb_info.get("rt60", 0.0),
-            "wet_init": reverb_info.get("wet", 0.0),
-            "n_segments": reverb_info.get("n_segments", 0),
-            "rt60_fixed": True,
-            "manual": bool(reverb_info.get("manual", False)),
-            "reverb_mode": reverb_info.get("reverb_mode", reverb_mode),
-            # --- 측정 IR(Rec-RIR) 모드 전용. synth 모드에서는 전부 None/0 이다. ---
-            "ir_engine": reverb_info.get("ir_engine"),
-            "ir_source": reverb_info.get("ir_source"),
-            "ir_ms": reverb_info.get("ir_ms", 0.0),
-            "analysis_start_s": reverb_info.get("analysis_start_s"),
-            "edt": reverb_info.get("edt", 0.0),
-            "drr_db": reverb_info.get("drr_db"),
-            "c80_db": reverb_info.get("c80_db"),
-            "rt60_low": reverb_info.get("rt60_low", 0.0),
-            "rt60_mid": reverb_info.get("rt60_mid", 0.0),
-            "rt60_high": reverb_info.get("rt60_high", 0.0),
-            "hf_lf_ratio": reverb_info.get("hf_lf_ratio", 0.0),
+            # Wet은 사용자가 지정한 dry/wet 혼합 비율이다.
+            "wet": float(wet) if reverb_active else 0.0,
             "loss": float(last["L_decay_raw"]),
             "error_db": reverb_err,
             "similarity": float(np.clip(100.0 * np.exp(-0.05 * reverb_err), 50.0, 99.5)),
+            "manual": True,
             "active": reverb_active,
         },
         "gate_data": None,

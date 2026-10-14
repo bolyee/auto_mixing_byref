@@ -29,11 +29,11 @@ style: |
   table { font-size: 0.75em; }
 ---
 
-# 발표
+# 미분 가능한 오디오 연산 그래프 기반의<br>레퍼런스 가이드 엔드투엔드 보컬 믹싱 & 마스터링 시스템
 
-DDSP Vocal Auto-Mix 
+### Reference-Guided End-to-End Vocal Mixing & Mastering
 
-이현중 · 2026.09.02
+이현중 · 2026.09
 
 
 ---

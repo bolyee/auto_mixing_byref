@@ -34,10 +34,6 @@ data/outputs/
 *.pth
 *.ckpt
 
-# --- Third-party repo (clone separately) ---
-# git clone https://github.com/Audio-WestlakeU/Rec-RIR.git
-Rec-RIR/
-
 # --- Docs / papers ---
 ddsp_paper.pdf
 

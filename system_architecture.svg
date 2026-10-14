@@ -27,12 +27,12 @@
   <!-- ================= STAGE 1: DDSP Vocal Optimization ================= -->
   <rect x="10" y="10" width="625" height="280" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" />
   <rect x="22" y="18" width="370" height="22" rx="4" fill="#e2e8f0" />
-  <text x="30" y="34" font-size="12" font-weight="700" fill="#1e293b">Stage 1. DDSP 보컬 자율 최적화 (50-Step Unsupervised Backprop)</text>
+  <text x="30" y="34" font-size="12" font-weight="700" fill="#1e293b">Stage 1. 레퍼런스 기반 보컬 최적화 (기본 50회)</text>
 
   <!-- Input 1: My Raw Vocal -->
   <rect x="25" y="52" width="125" height="48" rx="8" fill="#eff6ff" stroke="#3b82f6" stroke-width="2" />
   <text x="87" y="73" font-size="12" font-weight="700" fill="#1e40af" text-anchor="middle">내 녹음 보컬</text>
-  <text x="87" y="89" font-size="10" font-weight="500" fill="#3b82f6" text-anchor="middle">(가공 전 Dry Track)</text>
+  <text x="87" y="89" font-size="10" font-weight="500" fill="#3b82f6" text-anchor="middle">(원본 보컬 입력)</text>
 
   <!-- Module 1: EQ -->
   <rect x="180" y="52" width="125" height="48" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.8" />
@@ -47,7 +47,7 @@
   <!-- Module 3: Reverb -->
   <rect x="505" y="52" width="115" height="48" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.8" />
   <text x="562" y="73" font-size="12" font-weight="700" fill="#1e3a8a" text-anchor="middle">Reverb 잔향</text>
-  <text x="562" y="89" font-size="10" fill="#64748b" text-anchor="middle">공간 IR 시뮬레이션</text>
+  <text x="562" y="89" font-size="10" fill="#64748b" text-anchor="middle">수동 RT60 / Wet 설정</text>
 
   <!-- Forward Arrows (Vocal Chain) -->
   <line x1="150" y1="76" x2="175" y2="76" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-blue)" />
@@ -57,12 +57,12 @@
   <!-- Input 2: Target Reference Song -->
   <rect x="25" y="195" width="165" height="52" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2" />
   <text x="107" y="217" font-size="12" font-weight="700" fill="#6d28d9" text-anchor="middle">타깃 레퍼런스 음원</text>
-  <text x="107" y="235" font-size="10" font-weight="600" fill="#7c3aed" text-anchor="middle">음원 분리 (Target Vocal)</text>
+  <text x="107" y="235" font-size="10" font-weight="600" fill="#7c3aed" text-anchor="middle">보컬 분리 선택 (Target Vocal)</text>
 
   <!-- Loss Calculation Module -->
   <rect x="245" y="195" width="235" height="52" rx="8" fill="#fff1f2" stroke="#e11d48" stroke-width="2" />
   <text x="362" y="217" font-size="12" font-weight="700" fill="#be123c" text-anchor="middle">음향학적 목적 손실 함수 (Loss)</text>
-  <text x="362" y="235" font-size="10" fill="#9f1239" text-anchor="middle">Mel 스펙트럼 톤 + Crest Factor</text>
+  <text x="362" y="235" font-size="10" fill="#9f1239" text-anchor="middle">Mel 톤 / Crest Factor 경사 분리</text>
 
   <!-- Reference to Loss -->
   <line x1="190" y1="221" x2="240" y2="221" stroke="#7c3aed" stroke-width="2" marker-end="url(#arr-purple)" />
@@ -75,14 +75,14 @@
   <!-- Backprop Loops -->
   <path d="M 330 195 V 135 H 242 V 105" fill="none" stroke="#e11d48" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arr-red)" />
   <path d="M 380 195 V 135 H 405 V 105" fill="none" stroke="#e11d48" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arr-red)" />
-  <rect x="260" y="125" width="170" height="20" rx="4" fill="#ffe4e6" stroke="#f43f5e" stroke-width="1" />
-  <text x="345" y="139" font-size="10" font-weight="700" fill="#be123c" text-anchor="middle">Adam 역전파 (50스텝 파라미터 갱신)</text>
+  <rect x="250" y="125" width="190" height="20" rx="4" fill="#ffe4e6" stroke="#f43f5e" stroke-width="1" />
+  <text x="345" y="139" font-size="10" font-weight="700" fill="#be123c" text-anchor="middle">Adam 갱신 (보컬 기본 50회)</text>
 
 
   <!-- ================= STAGE 2: Summing with Instrumental ================= -->
   <rect x="10" y="305" width="625" height="175" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" />
   <rect x="22" y="313" width="260" height="22" rx="4" fill="#e2e8f0" />
-  <text x="30" y="329" font-size="12" font-weight="700" fill="#1e293b">Stage 2. 풀믹스 서밍 &amp; 라우드니스 정렬</text>
+  <text x="30" y="329" font-size="12" font-weight="700" fill="#1e293b">Stage 2. 반주 합산 &amp; 레벨 정렬 (선택)</text>
 
   <!-- Input 3: Instrumental (MR) -->
   <rect x="25" y="360" width="145" height="52" rx="8" fill="#fff7ed" stroke="#f97316" stroke-width="2" />
@@ -106,7 +106,7 @@
   <!-- ================= STAGE 3: Mastering Chain ================= -->
   <rect x="650" y="10" width="400" height="470" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" />
   <rect x="662" y="18" width="270" height="22" rx="4" fill="#e2e8f0" />
-  <text x="670" y="34" font-size="12" font-weight="700" fill="#1e293b">Stage 3. 상용 마스터링 &amp; 최종 음원</text>
+  <text x="670" y="34" font-size="12" font-weight="700" fill="#1e293b">Stage 3. 레퍼런스 기반 마스터링 (선택)</text>
 
   <!-- Summing Output to Mastering EQ -->
   <path d="M 480 387 H 580 V 78 H 665" fill="none" stroke="#4f46e5" stroke-width="2.5" marker-end="url(#arr-indigo)" />
@@ -114,8 +114,8 @@
 
   <!-- Mastering EQ -->
   <rect x="670" y="55" width="220" height="46" rx="8" fill="#ffffff" stroke="#4f46e5" stroke-width="1.8" />
-  <text x="780" y="75" font-size="12" font-weight="700" fill="#312e81" text-anchor="middle">Mastering EQ (λ = 1.0)</text>
-  <text x="780" y="91" font-size="10" fill="#6366f1" text-anchor="middle">전체 주파수 밸런스 정돈 및 파워 보존</text>
+  <text x="780" y="75" font-size="12" font-weight="700" fill="#312e81" text-anchor="middle">Mastering EQ (λ = 0.5, 300회)</text>
+  <text x="780" y="91" font-size="10" fill="#6366f1" text-anchor="middle">20 Hz–10 kHz 톤 조정 · 에너지 보정</text>
 
   <!-- Limiter -->
   <rect x="670" y="140" width="220" height="58" rx="8" fill="#ffffff" stroke="#4f46e5" stroke-width="1.8" />
@@ -124,9 +124,9 @@
 
   <!-- Safety Brake -->
   <rect x="910" y="140" width="125" height="58" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.8" />
-  <text x="972" y="162" font-size="11" font-weight="700" fill="#92400e" text-anchor="middle">3 dB 안전 브레이크</text>
-  <text x="972" y="177" font-size="9" fill="#b45309" text-anchor="middle">max(|GR|) ≥ 3dB</text>
-  <text x="972" y="189" font-size="9" font-weight="700" fill="#dc2626" text-anchor="middle">페널티 브레이크</text>
+  <text x="972" y="162" font-size="11" font-weight="700" fill="#92400e" text-anchor="middle">평가 구간 GR 억제</text>
+  <text x="972" y="177" font-size="9" fill="#b45309" text-anchor="middle">3 dB 페널티 · 3.5 dB 가드</text>
+  <text x="972" y="189" font-size="9" font-weight="700" fill="#dc2626" text-anchor="middle">드라이브 기본 800회</text>
 
   <line x1="780" y1="101" x2="780" y2="135" stroke="#4f46e5" stroke-width="2" marker-end="url(#arr-indigo)" />
   <line x1="890" y1="169" x2="905" y2="169" stroke="#d97706" stroke-width="2" marker-end="url(#arr-amber)" />
@@ -134,19 +134,19 @@
   <!-- Reference Guide Card for Mastering -->
   <rect x="670" y="222" width="365" height="42" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.5" />
   <text x="852" y="240" font-size="11" font-weight="700" fill="#6d28d9" text-anchor="middle">Reference Song의 Loudest LUFS &amp; 음압 타깃 제공</text>
-  <text x="852" y="255" font-size="9" fill="#7c3aed" text-anchor="middle">리미터가 상용 음원과 동일한 음압 레벨까지 도달하도록 가이드</text>
+  <text x="852" y="255" font-size="9" fill="#7c3aed" text-anchor="middle">최대 10초 LUFS를 목표로 설정 · GR 제한과 균형</text>
 
   <line x1="780" y1="198" x2="780" y2="295" stroke="#2563eb" stroke-width="3" marker-end="url(#arr-blue)" />
 
   <!-- FINAL HERO CARD -->
   <rect x="668" y="300" width="368" height="165" rx="10" fill="#1e3a8a" stroke="#f59e0b" stroke-width="2.5" />
   <rect x="680" y="310" width="140" height="20" rx="4" fill="#f59e0b" />
-  <text x="750" y="324" font-size="10" font-weight="800" fill="#1e3a8a" text-anchor="middle">★ FINAL RELEASE ★</text>
-  <text x="852" y="352" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle">상용 발매 규격 최종 마스터 음원</text>
+  <text x="750" y="324" font-size="10" font-weight="800" fill="#1e3a8a" text-anchor="middle">FINAL OUTPUT</text>
+  <text x="852" y="352" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle">처리 결과 WAV 출력</text>
 
   <rect x="680" y="365" width="344" height="88" rx="6" fill="#1e40af" />
-  <text x="692" y="385" font-size="11" font-weight="600" fill="#e0e7ff">• 3대 입력(보컬 + 레퍼런스 + MR)의 완전한 자율 결합</text>
-  <text x="692" y="405" font-size="11" font-weight="600" fill="#e0e7ff">• Reference 음원의 음색·다이내믹스·음압 100% 매칭</text>
-  <text x="692" y="425" font-size="11" font-weight="600" fill="#e0e7ff">• True Peak -0.3 dBFS 준수 (스트리밍 왜곡 차단)</text>
-  <text x="692" y="443" font-size="11" font-weight="700" fill="#fde68a">• 단 50스텝 반복으로 전 과정 최적화 완성</text>
+  <text x="692" y="385" font-size="11" font-weight="600" fill="#e0e7ff">• 보컬 + 레퍼런스 입력 / MR은 선택</text>
+  <text x="692" y="405" font-size="11" font-weight="600" fill="#e0e7ff">• 레퍼런스 기반 톤·다이내믹스·음량 조정</text>
+  <text x="692" y="425" font-size="11" font-weight="600" fill="#e0e7ff">• 샘플 피크 -0.3 dBFS 제한 (TP 별도 평가)</text>
+  <text x="692" y="443" font-size="11" font-weight="700" fill="#fde68a">• 보컬 50회 / 마스터 EQ 300회·드라이브 800회</text>
 </svg>

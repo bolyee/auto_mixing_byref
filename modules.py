@@ -1,16 +1,4 @@
-"""
-E2E 파이프라인이 쓰는 미분 가능 DSP 모듈과 믹스·마스터링 단계.
-
-구성
-----
-· DifferentiableEQ / DifferentiableCompressor / DifferentiableReverb
-    `pipeline.E2EChain` 이 단일 그래프로 엮는 세 모듈.
-· mix_with_instrumental / master_track
-    보컬 매칭 이후 단계. 학습은 없고 결정론적 처리다.
-
-순차(greedy) 방식이던 옛 엔진 — match_eq, 1176 컴프(match_compression_1176),
-CrestFactorShaper 등 — 은 이 파일에서 제거했다. 원본 전체는 `legacy/ddsp.py` 에 보관.
-"""
+"""미분 가능 EQ, 컴프레서, 수동 리버브와 믹싱·마스터링 DSP 모듈."""
 
 
 import os
@@ -20,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 import librosa
 import soundfile as sf
+from losses import DSPMatchingLoss
 
 
 class DifferentiableReverb(nn.Module):
@@ -62,16 +51,16 @@ class DifferentiableReverb(nn.Module):
         rt60 = self.RT60_MIN + (self.RT60_MAX - self.RT60_MIN) * torch.sigmoid(self.raw_rt60)
         wet = self.wet_max * torch.sigmoid(self.raw_wet)   # Range: [0.0, wet_max]
         return rt60, wet
-        
+
     def forward(self, x, sig_fft=None, n_fft=None):
         rt60, wet = self.get_params()
-        
+
         # decay factor alpha
         alpha = 6.9078 / (rt60 * self.sample_rate)
-        
+
         t = torch.arange(self.num_samples, device=x.device, dtype=torch.float32)
         decay_envelope = torch.exp(-alpha * t)
-        
+
         rir_l = self.noise_l * decay_envelope
         rir_r = self.noise_r * decay_envelope
 
@@ -82,27 +71,27 @@ class DifferentiableReverb(nn.Module):
         # Pad input to preserve reverb tail
         x_pad = torch.cat([x, torch.zeros(self.num_samples, device=x.device)])
         n_sig = x_pad.shape[-1]
-        
+
         # Perform fast FFT convolution
         if sig_fft is None or n_fft is None:
             n_ker = rir_l.shape[-1]
             n_fft = 2 ** int(np.ceil(np.log2(n_sig + n_ker - 1)))
             sig_fft = torch.fft.rfft(x_pad, n=n_fft)
-            
+
         ker_l_fft = torch.fft.rfft(rir_l, n=n_fft)
         ker_r_fft = torch.fft.rfft(rir_r, n=n_fft)
-        
+
         y_l_fft = sig_fft * ker_l_fft
         y_r_fft = sig_fft * ker_r_fft
-        
+
         y_l = torch.fft.irfft(y_l_fft, n=n_fft)[..., :n_sig]
         y_r = torch.fft.irfft(y_r_fft, n=n_fft)[..., :n_sig]
-        
+
         # Mix dry and wet
         dry_pad = x_pad
         out_l = (1.0 - wet) * dry_pad + wet * y_l
         out_r = (1.0 - wet) * dry_pad + wet * y_r
-        
+
         return torch.stack([out_l, out_r], dim=0)
 
 
@@ -130,36 +119,36 @@ class DifferentiableEQ(nn.Module):
         self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.num_bands = num_bands
-        
+
         # 1. Compute frequency bins for STFT
         self.n_freqs = n_fft // 2 + 1
         freq_bins = np.fft.rfftfreq(n_fft, d=1.0/sample_rate)
         freq_bins_clean = np.copy(freq_bins)
         if freq_bins_clean[0] == 0:
             freq_bins_clean[0] = freq_bins_clean[1] * 0.25
-        
+
         # Log2 scale of STFT frequencies
         self.x = torch.tensor(np.log2(freq_bins_clean), dtype=torch.float32)
-        
+
         # 2. Log-spaced band center frequencies
         self.bands = np.logspace(np.log10(min_freq), np.log10(max_freq), num_bands)
         self.c = torch.tensor(np.log2(self.bands), dtype=torch.float32)
-        
+
         # 3. Compute bandwidth (spacing in log2 space)
         log_diffs = np.diff(np.log2(self.bands))
         avg_diff = np.mean(log_diffs)
         self.sigma = avg_diff * 0.6
-        
+
         # 4. Precompute the Gaussian filterbank matrix Phi (n_freqs x num_bands)
         Phi = np.zeros((self.n_freqs, num_bands))
         for j in range(num_bands):
             Phi[:, j] = np.exp(-((np.log2(freq_bins_clean) - self.c[j].item()) ** 2) / (2 * (self.sigma ** 2)))
-        
+
         self.register_buffer('Phi', torch.tensor(Phi, dtype=torch.float32))
         self.theta = nn.Parameter(torch.zeros(num_bands, dtype=torch.float32))
-        
+
     def get_eq_curve_db(self):
-        # hard_clamp=True: tanh 로 ±gain_scale_db 에 가둔다(legacy / 마스터링 EQ).
+        # hard_clamp=True: tanh 로 ±gain_scale_db 에 가둔다(마스터링 EQ).
         # hard_clamp=False: 상한 없이 선형. 게인 크기 제어는 손실의 제곱 페널티가 맡는다.
         #   tanh 는 상한에 닿기 전까지 저항이 0 이라 결국 "일단 밀고 벽에서 잘리는"
         #   사후 절단과 같아진다. 기울기 스케일은 원점에서의 tanh 와 동일하게 맞춰
@@ -269,7 +258,7 @@ class DifferentiableCompressor(nn.Module):
     A fixed ratio also removes the threshold/ratio trade-off: many (threshold,
     ratio) pairs produce nearly the same dynamic-range reduction, so with both free
     the solution was only weakly identified by a single scalar target (the dynamic
-    range metric -- crest factor by default, see `losses.DSPMatchingLoss.DYN_METRIC`).
+    range metric -- crest factor by default, the crest-factor metric).
 
     Two design points differ from a naive frame-wise implementation:
 
@@ -350,7 +339,7 @@ class DifferentiableCompressor(nn.Module):
             detach_params: if True the threshold is detached, so this call produces
                 **the same numbers** but contributes no gradient to the compressor.
                 Used to measure the tone loss on the compressed signal without
-                letting that loss steer the compressor (see `pipeline.LOSS_GRAD_MODE`).
+                letting that loss steer the compressor (see the E2E loss path).
                 Detaching a leaf changes nothing in the forward pass, so the output
                 is bit-identical to the non-detached call.
         Returns:
@@ -804,14 +793,14 @@ def _brickwall_limiter(x, sr, ceiling=0.97, release_ms=80.0, win=256, return_gr=
 
 def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
                  match_amount=1.0, gain_scale_db=8.0, ceiling_db=-0.3, eq_iters=300,
-                 max_gr_db=3.0, eq_l2=1.0, eq_smooth=1.0, lr_eq=0.05,
+                 max_gr_db=3.0, eq_l2=0.5, eq_smooth=0.5, lr_eq=0.05,
                  limiter_ratio=50.0, limiter_attack_ms=0.1, limiter_release_ms=80.0,
                  limiter_knee_db=1.0, max_gain_db=None):
     """
     최종 풀믹스 마스터링: 레퍼런스 곡의 톤(EQ)을 따라가고 라우드니스를 맞춘 뒤 DifferentiableLimiter 로 피크 제한.
 
-    1) 20 Hz ~ 10 kHz DDSP EQ로 풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭(hard_clamp=False, L2/스무딩 페널티 1.0, 코덱 절벽 방지).
-    2) 레퍼런스의 활성 RMS(최대 3초 LUFS)에 맞춰 볼륨(인풋 드라이브 게인) 계산.
+    1) 20 Hz ~ 10 kHz DDSP EQ로 풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭(hard_clamp=False, L2/스무딩 페널티 0.5, 코덱 절벽 방지).
+    2) 레퍼런스의 활성 RMS(최대 10초 LUFS)에 맞춰 볼륨(인풋 드라이브 게인) 계산.
     3) DifferentiableLimiter(미분 가능한 스테레오 링크 리미터: ratio 50:1, attack 0.1ms, release 80ms, knee 1.0dB)로
        천장(-0.3 dBFS)을 향해 볼륨을 밀어 올리면서 피크를 제어하고 클리핑을 방지.
 
@@ -826,41 +815,31 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
     mix = _to_stereo(np.asarray(mix, dtype=np.float32))
     ref = _to_stereo(np.asarray(ref, dtype=np.float32))
 
-    mix_mag, _, mel_fb = compute_spectral_envelope(mix.mean(0), sr, n_fft, hop, n_mels)
-    _, ref_mel, _ = compute_spectral_envelope(ref.mean(0), sr, n_fft, hop, n_mels)
+    # 모노 평균 파워 스펙트럼 [1, n_freqs]
+    mix_mag = np.abs(librosa.stft(mix.mean(0), n_fft=n_fft, hop_length=hop))
+    ref_mag = np.abs(librosa.stft(ref.mean(0), n_fft=n_fft, hop_length=hop))
+    mix_power = torch.tensor(np.mean(mix_mag ** 2, axis=1), dtype=torch.float32).unsqueeze(0)
+    ref_power = torch.tensor(np.mean(ref_mag ** 2, axis=1), dtype=torch.float32).unsqueeze(0)
 
-    # 손실 압축 음원(MP3/AAC)의 코덱 컷오프(16 kHz)로 인한 초고역 오차 왜곡 방지:
-    # 10 kHz 이하의 신뢰 구간만 손실 함수 평가 대역으로 지정
-    mel_freqs = librosa.mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=sr / 2.0)
-    mel_mask = torch.tensor(mel_freqs <= 10000.0, dtype=torch.bool)
+    # 믹싱과 동일한 DSPMatchingLoss 사용 (마스터링 대역: 20 Hz ~ 10 kHz, tone_norm='l1')
+    criterion = DSPMatchingLoss(
+        sample_rate=sr, n_fft=n_fft, hop_length=hop, n_mels=n_mels,
+        tone_fmin=20.0, tone_fmax=10000.0, tone_norm="l1"
+    )
 
     # --- Mastering EQ match (mix tone → reference tone) ---
-    # hard_clamp=False: 믹싱과 동일하게 벽(tanh)을 없애고 선형 개방.
-    # 대역: 20 Hz ~ 10 kHz (풀믹스 저역 킥/베이스는 온전히 반영하되, MP3/AAC 코덱 절벽으로 인한 에어 대역 훼손 방지)
-    # 페널티: eq_l2=1.0, eq_smooth=1.0 페널티로 매우 미세하고 완만하게만 작동하게 제한.
     eq = DifferentiableEQ(sample_rate=sr, n_fft=n_fft, num_bands=num_bands,
                           min_freq=20.0, max_freq=10000.0,
                           gain_scale_db=gain_scale_db, hard_clamp=False)
-    # lr 은 raw 파라미터 θ 의 스텝이고, 실제로 움직이는 양은 gain_scale_db 를 곱한
-    # dB 다(= lr × gain_scale_db). 믹싱 EQ(`pipeline.match_e2e` 의 lr_eq)와 같은 값을
-    # 쓰되 여기 gain_scale_db 가 8(믹싱 15)이라, dB 로 환산하면 0.4 dB/step 으로
-    # 믹싱의 0.75 dB/step 보다 미세하다 — 마스터링 쪽이 더 정밀해야 하므로 의도한 방향.
-    # 스텝 예산은 eq_iters=300 이라 도달 범위 120 dB, 필요량 대비 과잉이다.
     opt = optim.Adam(eq.parameters(), lr=lr_eq)
-    mix_power = torch.mean(mix_mag ** 2, dim=1)
-    ref_mel_norm = ref_mel / (torch.sum(ref_mel) + eps)
-    ref_mel_db = 10.0 * torch.log10(ref_mel_norm + eps)
 
     for _ in range(eq_iters):
         opt.zero_grad()
         curve_db, gains = eq.get_eq_curve_db()
-        filt_power = mix_power * torch.pow(10.0, curve_db / 10.0)
-        filt_mel = torch.matmul(mel_fb, filt_power)
-        filt_mel_norm = filt_mel / (torch.sum(filt_mel) + eps)
-        filt_mel_db = 10.0 * torch.log10(filt_mel_norm + eps)
+        filt_power = mix_power * torch.pow(10.0, curve_db.unsqueeze(0) / 10.0)
 
-        # 톤 매칭 MSE (10 kHz 이하 코덱 안전 대역만 평가) + L2 게인 크기 페널티 (eq_l2=1.0) + 인접 밴드 급변 억제 페널티 (eq_smooth=1.0)
-        loss = torch.mean((filt_mel_db[mel_mask] - ref_mel_db[mel_mask]) ** 2)
+        # 믹스 손실 함수 그대로 재사용 (Zero-mean dB 정규화 + L1 MAE)
+        loss = criterion._loss_tone_from_avg(filt_power, ref_power)
         if eq_l2 > 0.0:
             loss = loss + eq_l2 * torch.mean(gains ** 2)
         if eq_smooth > 0.0 and gains.numel() > 1:
@@ -875,7 +854,7 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
 
         # --- 레벨 중립화 ---
         g_lin = np.power(10.0, applied_curve_db / 20.0)
-        P = mix_power.numpy()
+        P = mix_power.squeeze(0).numpy()
         delta_db = 10.0 * np.log10(
             float(np.sum((g_lin ** 2) * P)) / float(np.sum(P) + eps) + eps
         )
@@ -897,8 +876,9 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         out[ch] = librosa.istft(S, hop_length=hop, length=mix.shape[1])
 
     # --- Loudness match to reference (LUFS, ITU-R BS.1770 K-weighting) ---
-    ref_lufs = _loudest_lufs(ref, sr, win_sec=3.0)
-    out_lufs = _loudest_lufs(out, sr, win_sec=3.0)
+    win_sec = 10.0
+    ref_start, ref_end, ref_lufs = loudest_window(ref, sr, win_sec=win_sec, hop_sec=1.0)
+    out_start, out_end, out_lufs = loudest_window(out, sr, win_sec=win_sec, hop_sec=1.0)
     makeup_requested = max(0.0, ref_lufs - out_lufs)
 
     # --- DifferentiableLimiter 기반 미분 가능 안전 볼륨 최적화 (Adam) ---
@@ -915,9 +895,8 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
 
     pre_makeup_tensor = torch.from_numpy(out).float()
 
-    # 속도와 정확도를 위해 가장 에너지가 큰 하이라이트 3초 구간을 기준으로 학습
-    start_samp, end_samp, _ = loudest_window(out, sr, win_sec=3.0, hop_sec=1.0)
-    eval_slice = pre_makeup_tensor[:, start_samp:end_samp]
+    # 속도와 정확도를 위해 가장 에너지가 큰 하이라이트 10초 구간을 기준으로 학습
+    eval_slice = pre_makeup_tensor[:, out_start:out_end]
 
     target_boost_db = float(makeup_requested)
 
@@ -969,7 +948,7 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
 
     sf.write(out_path, out.T, sr)
 
-    final_lufs = _loudest_lufs(out, sr, win_sec=3.0)
+    final_lufs = _loudest_lufs(out, sr, win_sec=win_sec)
     final_peak = float(np.max(np.abs(out)))
     return {
         "out_path": out_path,
@@ -985,91 +964,11 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         "limiter_gr_mean_db": round(float(gr["mean_db"]), 2),
         "limiter_active_pct": round(float(gr["active"]) * 100.0, 1),
         "max_gr_budget_db": max_gr_db,
+        "window_sec": win_sec,
+        "window_track_s": [round(float(out_start) / sr, 1), round(float(out_end) / sr, 1)],
+        "window_ref_s": [round(float(ref_start) / sr, 1), round(float(ref_end) / sr, 1)],
         "ref_lufs": round(float(ref_lufs), 2),
         "final_lufs": round(float(final_lufs), 2),
         "ceiling_db": ceiling_db,
         "final_peak_db": round(float(20.0 * np.log10(final_peak + 1e-8)), 2),
     }
-
-
-class MeasuredIRReverb(nn.Module):
-    """추정된 임펄스 응답을 컨볼브하기만 하는 리버브. **학습 파라미터가 없다.**
-
-    `DifferentiableReverb` 는 `노이즈 × exp(-at)` 로 IR 을 합성한다. 모양이 지수함수
-    하나로 강제되므로 대역별 감쇠도, 초기반사도 표현하지 못한다(실측: 100Hz 0.73s vs
-    8kHz 0.65s 로 거의 동일, 0 ms 부터 에코 밀도 최대). 물리적으로 완벽히 확산된
-    이상적 공간의 소리이고 실재하지 않아 "화장실 같은" 느낌을 준다.
-
-    IR 은 `recrir_ir.estimate_ir` 가 Rec-RIR 로 레퍼런스나 반주에서 추정한 것을 쓴다.
-    IR 은 학습하지 않는다 — 레퍼런스가 다른 연주라 수만 개 샘플을 구속할 학습 신호가
-    없기 때문이다. 늘어난 것은 자유도가 아니라 측정 해상도다.
-
-    센드(aux) 구조인 이유 — 고역 보존
-    ---------------------------------
-    IR 전체를 컨볼브해 그것만 출력으로 쓰면 안 된다. Rec-RIR 은 **16 kHz 모델**이라
-    IR 에 8 kHz 위 성분이 아예 없다. 컨볼루션은 주파수 영역에서 곱셈이므로
-    `출력(f) = 보컬(f) × IR(f)` 이고, `IR(f)` 가 8 kHz 위에서 0 이면 **보컬의 8 kHz
-    위가 통째로 0 이 된다.** 잔향만 어두워지는 게 아니라 원본 보컬의 공기감·치찰음이
-    사라진다 — 8 kHz 로우패스를 건 것과 같다.
-
-    그래서 드라이는 IR 을 통과시키지 않는다:
-
-        출력 = 보컬 + amount × conv(보컬, IR 테일)
-
-    드라이는 44.1 kHz 전대역 그대로 남고, IR 을 거치는 건 잔향 성분뿐이다.
-    실제 리버브 플러그인의 send/return 구성과 같다.
-
-    테일은 IR 에서 직접음 피크 이후 `direct_ms` 를 지난 부분으로 정의한다. 직접음을
-    빼는 이유는 그게 드라이 경로와 중복되기 때문이다. 남겨 두면 원본과 2.5 ms 어긋난
-    복사본이 더해져(`method/pim.py` 가 `argmax - 2.5ms` 부터 자른다) 200 Hz 부터
-    400 Hz 간격의 콤필터가 생긴다 — 보컬 바디 한복판이라 바로 들린다.
-
-    IR 이 모노라 좌/우가 같다(듀얼 모노). Rec-RIR 은 단일 채널 RIR 만 추정한다.
-    """
-
-    def __init__(self, ir, sample_rate=44100, direct_ms=5.0):
-        super().__init__()
-        self.sample_rate = sample_rate
-
-        h = torch.as_tensor(ir, dtype=torch.float32).flatten()
-
-        # 직접음 피크 이후 direct_ms 까지를 0 으로 지워 **테일만** 남긴다.
-        # 잘라내지 않고 0 으로 두는 이유: 테일의 시작 시점(프리딜레이)이 원본 IR 의
-        # 위치 그대로 보존되어야 공간감이 유지된다.
-        tail = h.clone()
-        k = int(torch.argmax(h.abs()))
-        cut = min(k + int(direct_ms * 1e-3 * sample_rate), tail.numel())
-        tail[:cut] = 0.0
-
-        self.num_samples = tail.numel()
-        self.register_buffer('ir', h)        # 원본 IR (지표·참고용)
-        self.register_buffer('tail', tail)   # 실제로 컨볼브되는 잔향 성분
-
-        # DifferentiableReverb 와 인터페이스를 맞추기 위한 자리표시자.
-        # 둘 다 학습하지 않는다 — 이 모듈에는 학습 파라미터가 없다.
-        self.raw_rt60 = nn.Parameter(torch.tensor([0.0]), requires_grad=False)
-        self.raw_wet = nn.Parameter(torch.tensor([0.0]), requires_grad=False)
-        self._rt60_info = 0.0
-
-    def get_params(self):
-        """(rt60, wet). wet 은 호출부가 넘기는 amount 가 결정하므로 여기선 1.0."""
-        rt60 = torch.tensor(self._rt60_info, device=self.ir.device)
-        return rt60, torch.tensor(1.0, device=self.ir.device)
-
-    def forward(self, x, amount: float = 1.0):
-        """`amount` = 잔향 센드량. 0 이면 완전 드라이, 1 이면 IR 테일 그대로."""
-        # 테일이 잘리지 않도록 IR 길이만큼 패딩한다.
-        x_pad = torch.cat([x, torch.zeros(self.num_samples, device=x.device)])
-
-        if amount <= 0.0:
-            return torch.stack([x_pad, x_pad], dim=0)
-
-        n_sig = x_pad.shape[-1]
-        n_fft = 2 ** int(np.ceil(np.log2(n_sig + self.num_samples - 1)))
-
-        wet = torch.fft.irfft(
-            torch.fft.rfft(x_pad, n=n_fft) * torch.fft.rfft(self.tail, n=n_fft), n=n_fft
-        )[..., :n_sig]
-
-        y = x_pad + amount * wet
-        return torch.stack([y, y], dim=0)

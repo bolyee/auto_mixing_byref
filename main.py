@@ -2,7 +2,7 @@ import os
 import uuid
 import shutil
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from modules import mix_with_instrumental, master_track
@@ -56,28 +56,15 @@ async def api_match_eq(
     match_amount: float = Form(1.0),
     match_volume: bool = Form(False),
     comp_amount: float = Form(1.0),
-    reverb_amount: float = Form(1.0),
     mode: str = Form("both"),
     instrumental: UploadFile = File(None),
-    vocal_gain_db: float = Form(0.0),
+    vocal_gain_db: float = Form(-2.0),
     separate_ref: bool = Form(False),
     master: bool = Form(True),
     e2e_steps: int = Form(50),
-    # 잔향(IR)을 어디서 측정할지: "instrumental"(반주, 기본) 또는 "reference"(레퍼런스 보컬)
-    ir_source: str = Form("instrumental"),
-    # 잔향 생성 방식
-    #   "measured" — Rec-RIR 이 추정한 IR 을 그대로 컨볼브
-    #   "synth"    — 레퍼런스에서 rt60 추출 후 wet 을 학습
-    #   "manual"   — 아래 manual_rt60 / manual_wet 을 그대로 사용 (추정·학습 없음) **기본**
-    # 기본이 manual 인 이유: IR 추정이 최초 약 60초 걸리고, 새 세션에서 바로 결과를 보려면
-    # 추정 단계가 없는 쪽이 낫다. UI 토글 기본값(`static/index.html` rmode-manual)과 맞춘다.
-    reverb_mode: str = Form("manual"),
-    # 수동 모드 전용. RT60 은 [0.1, 4.0]s, wet 은 [0, 1] 로 클립된다.
+    # 수동으로 지정하는 리버브 시간과 혼합 비율.
     manual_rt60: float = Form(1.0),
-    manual_wet: float = Form(0.3),
-    # True 면 리버브 4조합(measured/synth × instrumental/reference)을 모두 렌더해
-    # 웹에서 들어보며 비교할 수 있게 한다.
-    compare_reverbs: bool = Form(False)
+    manual_wet: float = Form(0.2)
 ):
     # Validate file extensions (instrumental optional)
     files_to_check = [raw_vocal, ref_vocal]
@@ -136,7 +123,7 @@ async def api_match_eq(
             ref_for_match = ref_extracted_path
 
         # Run EQ Matching
-        def _run(out, r_mode, i_src):
+        def _run(out):
             return match_e2e(
                 raw_path=raw_path,
                 ref_path=ref_for_match,
@@ -150,56 +137,14 @@ async def api_match_eq(
                 match_volume=match_volume,
                 gain_scale_db=15.0,
                 comp_amount=comp_amount,
-                reverb_amount=reverb_amount,
                 mode=mode,
                 n_steps=e2e_steps,
-                ir_source=i_src,
-                reverb_mode=r_mode,
                 manual_rt60=manual_rt60,
                 manual_wet=manual_wet,
                 inst_path=inst_path,
             )
 
-        reverb_variants = {}
-        # 4조합 비교는 자동 모드(measured/synth × 반주/레퍼런스)의 비교다. 수동 모드는
-        # 추정 대상이 없어 비교할 축이 없으므로, 켜져 있어도 무시하고 지정값으로 1회만 돌린다.
-        if compare_reverbs and reverb_mode == "manual":
-            compare_reverbs = False
-        if compare_reverbs:
-            # 리버브 4조합을 각각 돌린다. 첫 조합의 결과를 대표(result)로 쓰고
-            # 나머지는 비교용 오디오로만 남긴다.
-            combos = [
-                ("measured", "instrumental"),
-                ("measured", "reference"),
-                ("synth", "instrumental"),
-                ("synth", "reference"),
-            ]
-            result = None
-            for r_mode, i_src in combos:
-                key = f"{r_mode}_{i_src}"
-                vpath = os.path.join(OUTPUTS_DIR, f"rv_{key}_{session_id}.wav")
-                try:
-                    res = _run(vpath, r_mode, i_src)
-                except Exception as exc:
-                    print(f"[compare] {key} 실패: {exc}")
-                    continue
-                rv = res.get("reverb_data", {}) or {}
-                reverb_variants[key] = {
-                    "url": f"/data/outputs/rv_{key}_{session_id}.wav",
-                    "reverb_mode": r_mode,
-                    "ir_source": i_src,
-                    "rt60": rv.get("rt60", 0.0),
-                    "wet": rv.get("wet", 0.0),
-                    "n_segments": rv.get("n_segments", 0),
-                    "active": rv.get("active", False),
-                }
-                if result is None:
-                    result = res
-                    shutil.copyfile(vpath, out_path)
-            if result is None:
-                raise RuntimeError("리버브 비교 조합이 모두 실패했습니다.")
-        else:
-            result = _run(out_path, reverb_mode, ir_source)
+        result = _run(out_path)
         
         # Mix with instrumental → full mix (optional). 처리후/처리전 두 버전 생성(발표용 A/B).
         fullmix_info = None
@@ -262,7 +207,6 @@ async def api_match_eq(
                 "comp_ratio": comp_ratio,
                 "comp_thresh_weight": comp_thresh_weight,
             },
-            "reverb_variants": reverb_variants,
             "audio_urls": audio_urls,
             "separated_ref": bool(separate_ref and ref_extracted_path),
             "match_error": result["match_error"],
