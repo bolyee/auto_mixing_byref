@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1400" viewBox="0 0 1200 1400">
+<defs><marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#087F8C"/></marker><marker id="arr2" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#B56524"/></marker></defs>
+<rect width="1200" height="1400" rx="24" fill="#fff"/>
+<text x="600" y="62" text-anchor="middle" font-family="sans-serif" font-size="32" font-weight="700" fill="#172338">④ 시스템 처리 흐름 / 시스템 구성도</text>
+<g font-family="sans-serif" fill="#172338" text-anchor="middle">
+<rect x="325" y="100" width="550" height="68" rx="14" fill="#fff" stroke="#0A1F62" stroke-width="2"/><text x="600" y="143" font-size="24">레퍼런스 음원</text>
+<rect x="90" y="220" width="480" height="110" rx="14" fill="#fff" stroke="#0A1F62" stroke-width="2"/><text x="330" y="265" font-size="23">Demucs v4 보컬 분리</text><text x="330" y="300" font-size="18" fill="#536174">(레퍼런스 보컬 비교 시 선택)</text>
+<rect x="620" y="220" width="490" height="110" rx="14" fill="#fff" stroke="#0A1F62" stroke-width="2"/><text x="865" y="282" font-size="22">입력: 내 녹음 보컬 + 반주(MR, 선택)</text>
+<rect x="130" y="405" width="940" height="245" rx="18" fill="#eef6fb" stroke="#0A1F62" stroke-width="2"/><text x="600" y="450" font-size="27" font-weight="700">Stage 1: 보컬 최적화</text><text x="600" y="510" font-size="23">EQ → Compressor → Reverb</text><text x="600" y="553" font-size="21">타깃과 손실 비교 → 경사 분리 역전파</text><text x="600" y="595" font-size="21">Adam 50회: EQ·컴프레서 파라미터 갱신</text>
+<rect x="130" y="720" width="940" height="205" rx="18" fill="#f4f7fb" stroke="#0A1F62" stroke-width="2"/><text x="600" y="765" font-size="27" font-weight="700">Stage 2: 3초 LUFS 반주 합산</text><text x="600" y="825" font-size="21">3초 LUFS 동등 정렬(-2.0 dB) + tanh</text><text x="600" y="870" font-size="21">2트랙 믹스다운 · 반주 없으면 보컬 단독 전달</text>
+<rect x="130" y="995" width="940" height="245" rx="18" fill="#f4f7fb" stroke="#0A1F62" stroke-width="2"/><text x="600" y="1040" font-size="27" font-weight="700">Stage 3: 마스터링</text><text x="600" y="1090" font-size="20">레퍼런스 곡의 톤·음압 통합 최적화</text><text x="600" y="1130" font-size="19">경사 분리: 톤 손실→EQ · LUFS/GR 손실→드라이브</text><text x="600" y="1170" font-size="19">한 루프 300회 (EQ lr 0.05 · 드라이브 lr 0.1)</text><text x="600" y="1208" font-size="19">Ceiling −0.3 dBFS</text>
+<rect x="365" y="1300" width="470" height="68" rx="14" fill="#fff" stroke="#0A1F62" stroke-width="2"/><text x="600" y="1344" font-size="24">최종 음원 출력</text></g>
+<g fill="none" stroke="#087F8C" stroke-width="4" marker-end="url(#arr)"><path d="M330 330 V370 H600 V405"/><path d="M865 330 V370 H600 V405"/><path d="M600 650 V720"/><path d="M600 925 V995"/><path d="M600 1240 V1300"/></g>
+<path d="M600 168 V190 H330 V220" fill="none" stroke="#B56524" stroke-width="4" marker-end="url(#arr2)"/>
+</svg>

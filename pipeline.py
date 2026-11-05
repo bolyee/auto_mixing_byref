@@ -14,7 +14,6 @@ from modules import (
     DifferentiableCompressor,
     DifferentiableEQ,
     DifferentiableReverb,
-    compute_spectral_envelope,
     compute_stft_crest_factor,
     compute_stft_rms_variance,
     loudest_window,
@@ -389,6 +388,10 @@ def match_e2e(
     if max_gain_db is not None:
         gain_scale_db = max_gain_db
 
+    # Keep at least one RT60 of the impulse response (about -60 dB decay).
+    # Choose the length once, before creating the fixed noise buffers.
+    rt60_use = float(np.clip(manual_rt60, DifferentiableReverb.RT60_MIN, DifferentiableReverb.RT60_MAX))
+    reverb_seconds = max(1.5, rt60_use) if "reverb" in active_modes else 1.5
     chain = E2EChain(
         sample_rate=TARGET_SR,
         n_fft=N_FFT,
@@ -400,11 +403,11 @@ def match_e2e(
         comp_ratio=comp_ratio,
         active_modes=active_modes,
         reverb_wet_max=1.0,
+        reverb_seconds=reverb_seconds,
     )
 
     # 수동 리버브: RT60과 wet은 사용자가 지정하며 추정이나 학습을 하지 않는다.
     if "reverb" in active_modes:
-        rt60_use = float(np.clip(manual_rt60, DifferentiableReverb.RT60_MIN, DifferentiableReverb.RT60_MAX))
         wet_use = float(np.clip(manual_wet, 0.0, chain.reverb.wet_max))
         set_reverb_params(chain.reverb, rt60_use, wet_use)
         if verbose:
@@ -590,7 +593,9 @@ def match_e2e(
             tgt = torch.sqrt(torch.mean(t_ref**2) + _EPS)
             y_out = y_out * (tgt / cur)
 
-        y_processed = y_out.cpu().numpy()
+        y_processed = _soft_limit(y_out.cpu().numpy())
+        # 최종 평가와 화면은 소프트 리미터까지 적용한 동일한 출력으로 계산한다.
+        t_processed = torch.from_numpy(np.ascontiguousarray(y_processed)).float()
 
         # 리포팅용 지표는 **최종 출력에서 한 번만** 잰다.
         # 학습 루프는 움직일 파라미터가 없는 손실을 계산하지 않으므로(속도) 그 항의 원시값이
@@ -599,13 +604,12 @@ def match_e2e(
         # 1/n_steps 로 줄고, 값도 마지막 학습 스텝이 아니라 실제 결과물 기준이 된다.
         criterion.eval()
         report_losses = criterion.report(
-            y_out.unsqueeze(0),
+            t_processed.unsqueeze(0),
             target,
             sample_rate=TARGET_SR,
             compressor=chain.comp if "comp" in active_modes else None,
         )
 
-    y_processed = _soft_limit(y_processed)
 
     out_dir = os.path.dirname(out_path)
     if out_dir:
@@ -617,31 +621,18 @@ def match_e2e(
     # ---------------- 지표 & 차트 데이터 ----------------
     y_mono = y_processed.mean(axis=0)
 
-    _, raw_mel, _ = compute_spectral_envelope(y_raw, TARGET_SR, N_FFT, HOP_LENGTH, N_MELS)
-    _, ref_mel, _ = compute_spectral_envelope(y_ref, TARGET_SR, N_FFT, HOP_LENGTH, N_MELS)
-    _, proc_mel, _ = compute_spectral_envelope(
-        np.ascontiguousarray(y_mono), TARGET_SR, N_FFT, HOP_LENGTH, N_MELS
-    )
+    # 학습 손실의 STFT(reflect), 멜 필터, 평가 마스크와 dB 정렬을 그대로 공유한다.
+    # 별도 librosa 분석/주파수축을 만들면 경계 패딩과 평가 밴드가 달라진다.
+    with torch.no_grad():
+        def _tone_envelope(audio: torch.Tensor) -> torch.Tensor:
+            return criterion._tone_db(criterion._power_spec(audio.unsqueeze(0)))[0]
 
-    mel_freqs = librosa.mel_frequencies(n_mels=N_MELS, fmin=0, fmax=TARGET_SR / 2)
-    # 손실의 Ω 와 같은 대역이어야 화면 수치와 최적화 대상이 일치한다
-    eval_mask = torch.tensor(
-        (mel_freqs >= VOCAL_EQ_MIN_FREQ) & (mel_freqs < VOCAL_EQ_MAX_FREQ), dtype=torch.float32
-    )
+        raw_db = _tone_envelope(t_raw)
+        ref_db = _tone_envelope(t_ref)
+        proc_db = _tone_envelope(t_processed.mean(dim=0))
 
-    def _norm_db(mel: torch.Tensor) -> torch.Tensor:
-        """레벨 정렬된 mel dB. 손실(`losses._tone_db`)과 **같은 규칙**을 써야 한다.
-
-        총에너지로 나누면 평가 대상이 아닌 200 Hz 미만까지 기준 레벨에 섞여 들어가고,
-        차트에 그려지는 곡선과 실제로 최적화되는 양이 어긋난다.
-        """
-        db = 10.0 * torch.log10(mel + 1e-10)
-        return db - torch.sum(db * eval_mask) / (torch.sum(eval_mask) + _EPS)
-
-    raw_db, ref_db, proc_db = _norm_db(raw_mel), _norm_db(ref_mel), _norm_db(proc_mel)
-    tonal_mae = float(
-        (torch.sum(torch.abs(proc_db - ref_db) * eval_mask) / (torch.sum(eval_mask) + _EPS)).item()
-    )
+    mel_freqs = criterion.tone_frequencies.cpu().numpy()
+    tonal_mae = float(report_losses["L_tone_raw"])
 
     t_stft_ref = torch.stft(
         t_ref, N_FFT, HOP_LENGTH, window=torch.hann_window(N_FFT), center=True, return_complex=True

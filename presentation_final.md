@@ -80,12 +80,12 @@ style: |
   }
 ---
 
-# 미분 가능한 오디오 연산 그래프 기반의<br>레퍼런스 가이드 엔드투엔드 보컬 믹싱 & 마스터링 시스템
+# 레퍼런스 추종 End-to-End 믹싱 & 마스터링 시스템
 
-### Reference-Guided End-to-End Vocal Mixing & Mastering via Differentiable Audio Graphs
+### Reference-Guided End-to-End Mixing & Mastering System
 
 **발표자: 이현중**
-2026.09
+2026.10
 
 ---
 
@@ -308,6 +308,8 @@ $$D_m(y)=10\log_{10}((\Psi\overline{P_y})_m+\epsilon),\qquad \widetilde D_m(y)=D
 $$L_{tone}=\frac{1}{|\Omega|}\sum_{m\in\Omega}|\widetilde D_m(y)-\widetilde D_m(r)|$$
 - 멜 밴드 **80개**, 평가 대역 $\Omega$: 중심 주파수 **200 Hz 이상 10 kHz 미만**.
 - 곡 전체 파워 스펙트럼을 시간평균하고 평가 대역 평균 dB를 제거하여 레벨 정렬.
+- 화면도 내부와 같은 reflect STFT·멜 필터·무게중심 기반 평가 마스크 사용.
+- 최종 내부 평가와 화면 오차는 소프트 리미터 적용 후 같은 출력으로 계산.
 
 ### 2) 실제 dB 밴드 게인에 대한 정규화
 $$g_j=15\theta_j,\quad L_{reg}=\lambda_2\frac{1}{J}\sum_jg_j^2+\lambda_s\frac{1}{J-1}\sum_{j=0}^{J-2}(g_{j+1}-g_j)^2$$
@@ -362,7 +364,7 @@ $$L_{EQ}=L_{tone}+L_{reg},\qquad L_{Comp}=L_{dyn}$$
 4. Adam 갱신: 기본 `lr_eq = lr_comp = 0.05`, **보컬 기본 50회**.
 
 - 리버브의 RT60·Wet은 **수동 설정으로 고정**.
-- 마스터링은 별도 **EQ 300회·드라이브 800회**. 전 과정을 50회로 처리하는 것은 아님.
+- 마스터링은 별도 **같은 루프에서 EQ·드라이브 각각 300회**. 전 과정을 50회로 처리하는 것은 아님.
 - 실제 곡의 처리 시간은 길이·환경·옵션에 따라 측정 필요.
 
 ---
@@ -422,11 +424,12 @@ $$L_{EQ}=L_{tone}+L_{reg},\qquad L_{Comp}=L_{dyn}$$
 
 ---
 
-## 17. 마스터링 1단계: Mastering EQ (`master_track`)
+## 17. 통합 마스터링: EQ 최적화 (`master_track`)
 
 풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭 (`modules.py` 구현 기반):
 
 - 반주가 없으면 처리 보컬 자체를 마스터링 대상으로 사용.
+- EQ와 드라이브를 같은 300회 루프에서 갱신. 톤은 EQ에, LUFS·감쇄 페널티는 드라이브에만 역전파.
 
 ### 1) 믹싱 EQ vs 마스터링 EQ 파라미터 비교
 
@@ -454,7 +457,7 @@ $$L_{EQ}=L_{tone}+L_{reg},\qquad L_{Comp}=L_{dyn}$$
 
 ---
 
-## 18. 마스터링 2단계: 보컬 믹싱 컴프 vs 마스터링 리미터 비교
+## 18. 통합 마스터링: 드라이브·리미터와 보컬 컴프 비교
 
 풀믹스 다이내믹 제어 및 상용 음압(LUFS) 매칭 (`modules.py` 구현 기반):
 
@@ -475,9 +478,9 @@ $$L_{EQ}=L_{tone}+L_{reg},\qquad L_{Comp}=L_{dyn}$$
 | 파라미터 | 보컬 믹싱 컴프 (`DifferentiableCompressor`) | 마스터링 리미터 (`DifferentiableLimiter`) | 코드 위치 / 설정 근거 |
 |---|---|---|---|
 | **소프트 니 (`knee_db`)** | $4.0\text{ dB}$ | **$1.0\text{ dB}$** (천장 경계 정밀 완충) | `modules.py` |
-| **최적화 손실 함수** | $L_{dyn}=\lvert CF(y)-CF(r)\rvert$; 임계값 정규화는 기본 비활성 | $\mathcal{L} = \text{ReLU}(G_{\text{target}} - G_{\text{in}})^2 + 25.0 \cdot \text{ReLU}(\max(-\text{GR}) - 3.0)^2$ | `losses.py`, `modules.py` |
-| **게인 보상 / 안전 장치** | 활성 구간 평균 GR 계산 후 deterministic offset | **평가 10초 구간: 3.0 dB GR 페널티 + 3.5 dB 가드** | `pipeline.py`, `modules.py` |
-| **학습률 / 스텝** | `lr_comp = 0.05`, 50 스텝 E2E (모듈별 분리 그래디언트) | **`lr = 0.05`, 800 스텝** 단일 학습률 Adam | `pipeline.py`, `modules.py` |
+| **최적화 손실 함수** | $L_{dyn}=\lvert CF(y)-CF(r)\rvert$; 임계값 정규화는 기본 비활성 | $\mathcal{L} = (LUFS(y_{lim})-LUFS(r))^2 + 25.0 \cdot \text{ReLU}(\max(-\text{GR}) - 3.0)^2$ | `losses.py`, `modules.py` |
+| **게인 보상 / 안전 장치** | 활성 구간 평균 GR 계산 후 deterministic offset | **선택한 10초: 3.0 dB 페널티 + 3.5 dB 가드** (전곡 상한 아님) | `pipeline.py`, `modules.py` |
+| **학습률 / 스텝** | `lr_comp = 0.05`, 50 스텝 E2E (모듈별 분리 그래디언트) | **드라이브 `lr = 0.1`, 300회** (EQ `lr = 0.05`와 같은 루프) | `pipeline.py`, `modules.py` |
 
 ---
 

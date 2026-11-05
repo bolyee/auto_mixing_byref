@@ -722,21 +722,20 @@ _GR_HARD_CAP_DB = 3.5    # 최종 리미터 게인 리덕션 절대 상한
 
 _MIN_MAKEUP_DB  = -12.0  # 메이크업 하한(감쇠 허용). GR 상한을 지키기 위해 필요
 
-# 마스터링 드라이브 게인 탐색(Adam). Adam 의 스텝 크기는 그래디언트 크기와 거의
-# 무관하게 lr 로 고정되므로, 도달 가능한 dB 범위 = steps × lr 이다.
+# 통합 마스터링 루프의 드라이브 게인 Adam 설정. EQ와 LUFS/리미터 손실을 매 반복
+# 함께 계산하지만, 경사 분리로 각 손실은 자기 파라미터에만 영향을 준다.
+# Adam 의 스텝 크기는 그래디언트 크기와 거의 무관하게 lr 로 고정되므로,
+# 도달 가능한 dB 범위 = steps × lr 이다.
 #
 # 이 파라미터는 dB 그 자체라 raw→dB 증폭이 없다(야코비안 1). EQ 의 θ 가 gain_scale_db
 # 배로, 컴프의 raw_threshold 가 60·σ(1-σ) 배로 증폭되는 것과 달리 lr 이 그대로
-# dB/step 이라, 다른 모듈과 같은 0.05 를 쓰면 같은 스텝수로 10배 이상 덜 움직인다.
-# 그래서 lr 은 0.05 로 통일하고 부족한 주행거리는 스텝으로 메운다. 이 루프는 3초
-# 하이라이트 구간에만 걸려 스텝당 1.25 ms 이므로(실측: 80→320 스텝에서 6.2s→6.5s)
-# 스텝을 늘리는 비용이 사실상 없다.
+# dB/step 이라, 드라이브 학습률은 0.1로 별도 설정한다. 음압/리미터 손실은 선택한
+# 10초 하이라이트 구간에 대해 계산한다.
 #
-# 800 × 0.05 = 40 dB. 실제로 필요한 폭은 `target_boost - _MIN_MAKEUP_DB` 로 최대
-# 30 dB 남짓이라(레퍼런스보다 30 dB 조용한 믹스는 없다) 여유가 있다. 수렴 후에는
-# 제자리에 서 있을 뿐이라 스텝을 더 줘도 결과가 같다(1600 으로 검증, 값 동일).
-_DRIVE_STEPS = 800
-_DRIVE_LR    = 0.05
+# EQ 300회와 동일한 횟수로 갱신하며, 300 × 0.1 = 약 30 dB 이동 폭을 확보한다.
+# 최종 리미터 감쇄량은 별도의 결정론적 하드 캡 가드로 확인한다.
+_DRIVE_STEPS = 300
+_DRIVE_LR    = 0.1
 # 소프트 페널티가 수렴하지 못한 경우를 위한 결정론적 하드 캡 가드.
 _DRIVE_GUARD_STEPS = 80
 _DRIVE_GUARD_DB    = 0.25
@@ -797,12 +796,11 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
                  limiter_ratio=50.0, limiter_attack_ms=0.1, limiter_release_ms=80.0,
                  limiter_knee_db=1.0, max_gain_db=None):
     """
-    최종 풀믹스 마스터링: 레퍼런스 곡의 톤(EQ)을 따라가고 라우드니스를 맞춘 뒤 DifferentiableLimiter 로 피크 제한.
+    최종 풀믹스 마스터링: 전체 곡 톤 매칭과 10초 LUFS/리미터 최적화를 한 루프에서 수행.
 
     1) 20 Hz ~ 10 kHz DDSP EQ로 풀믹스의 멜 스펙트럼 포락선을 레퍼런스 곡에 매칭(hard_clamp=False, L2/스무딩 페널티 0.5, 코덱 절벽 방지).
-    2) 레퍼런스의 활성 RMS(최대 10초 LUFS)에 맞춰 볼륨(인풋 드라이브 게인) 계산.
-    3) DifferentiableLimiter(미분 가능한 스테레오 링크 리미터: ratio 50:1, attack 0.1ms, release 80ms, knee 1.0dB)로
-       천장(-0.3 dBFS)을 향해 볼륨을 밀어 올리면서 피크를 제어하고 클리핑을 방지.
+    2) 통합 역전파에서 톤 손실은 EQ로만, 10초 LUFS/리미터 감쇄 손실은 드라이브 게인으로만 전달.
+    3) DifferentiableLimiter(미분 가능한 스테레오 링크 리미터)로 피크와 게인 감쇄를 제어.
 
     Returns: dict(정보)
     """
@@ -827,63 +825,19 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         tone_fmin=20.0, tone_fmax=10000.0, tone_norm="l1"
     )
 
-    # --- Mastering EQ match (mix tone → reference tone) ---
+    # --- 통합 마스터링: EQ 톤 + LUFS/리미터를 한 학습 루프에서 최적화 ---
     eq = DifferentiableEQ(sample_rate=sr, n_fft=n_fft, num_bands=num_bands,
                           min_freq=20.0, max_freq=10000.0,
                           gain_scale_db=gain_scale_db, hard_clamp=False)
-    opt = optim.Adam(eq.parameters(), lr=lr_eq)
+    eq_opt = optim.Adam(eq.parameters(), lr=lr_eq)
 
-    for _ in range(eq_iters):
-        opt.zero_grad()
-        curve_db, gains = eq.get_eq_curve_db()
-        filt_power = mix_power * torch.pow(10.0, curve_db.unsqueeze(0) / 10.0)
-
-        # 믹스 손실 함수 그대로 재사용 (Zero-mean dB 정규화 + L1 MAE)
-        loss = criterion._loss_tone_from_avg(filt_power, ref_power)
-        if eq_l2 > 0.0:
-            loss = loss + eq_l2 * torch.mean(gains ** 2)
-        if eq_smooth > 0.0 and gains.numel() > 1:
-            loss = loss + eq_smooth * torch.mean(torch.diff(gains) ** 2)
-
-        loss.backward()
-        opt.step()
-
-    with torch.no_grad():
-        curve_db, _ = eq.get_eq_curve_db()
-        applied_curve_db = (curve_db * match_amount).numpy()
-
-        # --- 레벨 중립화 ---
-        g_lin = np.power(10.0, applied_curve_db / 20.0)
-        P = mix_power.squeeze(0).numpy()
-        delta_db = 10.0 * np.log10(
-            float(np.sum((g_lin ** 2) * P)) / float(np.sum(P) + eps) + eps
-        )
-        applied_curve_db = applied_curve_db - delta_db
-        eq_level_shift_db = float(delta_db)
-
-        gains_lin = np.power(10.0, applied_curve_db / 20.0)
-
-    # 적용된 마스터 EQ 커브를 로그 간격 ~120점으로 샘플링(UI 차트용)
-    freq_bins = np.fft.rfftfreq(n_fft, d=1.0 / sr)
-    sample_idx = np.unique(np.logspace(0, np.log10(len(freq_bins) - 1), 120).astype(int))
-    eq_curve_x = [float(freq_bins[i]) for i in sample_idx]
-    eq_curve_y = [float(applied_curve_db[i]) for i in sample_idx]
-
-    out = np.zeros_like(mix)
-    for ch in range(mix.shape[0]):
-        S = librosa.stft(mix[ch], n_fft=n_fft, hop_length=hop)
-        S = S * gains_lin[:, None]
-        out[ch] = librosa.istft(S, hop_length=hop, length=mix.shape[1])
-
-    # --- Loudness match to reference (LUFS, ITU-R BS.1770 K-weighting) ---
+    # 톤은 전체 곡 평균 스펙트럼으로, 음압은 각 트랙의 가장 큰 10초로 평가한다.
+    # 창 선택은 최적화 전에 고정해, 반복 중 평가 구간이 바뀌며 손실이 튀지 않게 한다.
     win_sec = 10.0
+    mix_start, mix_end, mix_lufs = loudest_window(mix, sr, win_sec=win_sec, hop_sec=1.0)
     ref_start, ref_end, ref_lufs = loudest_window(ref, sr, win_sec=win_sec, hop_sec=1.0)
-    out_start, out_end, out_lufs = loudest_window(out, sr, win_sec=win_sec, hop_sec=1.0)
-    makeup_requested = max(0.0, ref_lufs - out_lufs)
+    makeup_requested = max(0.0, ref_lufs - mix_lufs)
 
-    # --- DifferentiableLimiter 기반 미분 가능 안전 볼륨 최적화 (Adam) ---
-    # 목표 부스트(target_boost_db)에서 시작해 lr=_DRIVE_LR(0.05)로 내려오면서,
-    # 목표 LUFS와 리미터 3.0 dB 상한선 페널티 사이의 스윗스팟을 부드럽게 탐색
     limiter = DifferentiableLimiter(
         sample_rate=sr,
         ceiling_db=ceiling_db,
@@ -892,56 +846,121 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         release_ms=limiter_release_ms,
         knee_db=limiter_knee_db,
     )
-
-    pre_makeup_tensor = torch.from_numpy(out).float()
-
-    # 속도와 정확도를 위해 가장 에너지가 큰 하이라이트 10초 구간을 기준으로 학습
-    eval_slice = pre_makeup_tensor[:, out_start:out_end]
-
-    target_boost_db = float(makeup_requested)
-
-    # 초기값 = 목표 부스트. 0 에서 시작하면 Adam 의 스텝 크기가 대략 lr 로 고정돼
-    # (n_steps × lr) dB 이상은 절대 못 올라간다 — 목표가 그보다 크면 라우드니스가
-    # 조용한 쪽으로 잘린 채 끝난다. 목표에서 시작하고 GR 페널티가 필요한 만큼만
-    # 되돌리게 하면(예전 makeup 되감기 루프와 같은 방향) 그 절단이 사라진다.
-    drive_gain = nn.Parameter(torch.full((1,), target_boost_db))
+    drive_gain = nn.Parameter(torch.tensor([makeup_requested], dtype=torch.float32))
     drive_opt = optim.Adam([drive_gain], lr=_DRIVE_LR)
 
-    for step in range(_DRIVE_STEPS):
+    # EQ가 적용될 선택 구간을 미리 STFT로 변환한다. 창 양끝에 n_fft 문맥을 포함해
+    # 매 반복에서 10초 구간 자체를 잘라 필터링할 때 생기는 경계 왜곡을 줄인다.
+    context_start = max(0, mix_start - n_fft)
+    context_end = min(mix.shape[1], mix_end + n_fft)
+    context = torch.from_numpy(mix[:, context_start:context_end]).float()
+    eval_offset = mix_start - context_start
+    eval_samples = mix_end - mix_start
+    stft_window = torch.hann_window(n_fft)
+    context_stft = torch.stft(
+        context, n_fft=n_fft, hop_length=hop, window=stft_window,
+        center=True, pad_mode="constant", return_complex=True,
+    )
+
+    # LUFS target도 미분 가능한 같은 미터로 계산한다. 채널별 에너지는 BS.1770 방식으로
+    # 합산하며, loudness 손실 그래프는 EQ 입력에서 detach해 드라이브 게인에만 전달한다.
+    ref_eval = torch.from_numpy(ref[:, ref_start:ref_end]).float().unsqueeze(0)
+    ref_target_lufs = criterion.meter.integrated_lufs_channels(ref_eval).detach()[0]
+    drive_max_db = max(makeup_requested, 0.0) + 6.0
+
+    # 두 손실을 같은 outer loop에서 더해 한 번 역전파한다.
+    # Selective gradient: tone → EQ만, LUFS/limiter → 드라이브 게인만.
+    total_steps = max(eq_iters, _DRIVE_STEPS)
+    for step in range(total_steps):
+        eq_opt.zero_grad()
         drive_opt.zero_grad()
-        out_eval, gr_eval = limiter(eval_slice, input_gain_db=drive_gain, return_gr=True)
 
-        # 1. 볼륨 손실: 목표치(target_boost_db)에 도달할 때까지 밀어올림
-        loss_vol = torch.relu(target_boost_db - drive_gain) ** 2
+        curve_db, band_gains = eq.get_eq_curve_db()
+        tone_curve_db = curve_db * match_amount
+        if step < eq_iters:
+            filt_power = mix_power * torch.pow(10.0, tone_curve_db.unsqueeze(0) / 10.0)
+            loss_tone = criterion._loss_tone_from_avg(filt_power, ref_power)
+            if eq_l2 > 0.0:
+                loss_tone = loss_tone + eq_l2 * torch.mean(band_gains ** 2)
+            if eq_smooth > 0.0 and band_gains.numel() > 1:
+                loss_tone = loss_tone + eq_smooth * torch.mean(torch.diff(band_gains) ** 2)
+        else:
+            loss_tone = curve_db.new_zeros(())
 
-        # 2. 리미터 3.0 dB 상한선 페널티: 리덕션이 max_gr_db(3.0 dB)를 넘으면 강력한 브레이크
+        # EQ의 전체 레벨 변화는 중립화해 톤 보정과 음압 조정을 분리한다.
+        gains_amp = torch.pow(10.0, tone_curve_db / 20.0)
+        mix_power_flat = mix_power.squeeze(0)
+        delta_db = 10.0 * torch.log10(
+            ((gains_amp ** 2) * mix_power_flat).sum() / (mix_power_flat.sum() + eps) + eps
+        )
+        applied_curve_db = tone_curve_db - delta_db
+        gains_lin = torch.pow(10.0, applied_curve_db / 20.0)
+
+        filtered_context_stft = context_stft * gains_lin.view(1, -1, 1)
+        filtered_context = torch.istft(
+            filtered_context_stft, n_fft=n_fft, hop_length=hop, window=stft_window,
+            center=True, length=context.shape[-1],
+        )
+        eq_eval = filtered_context[:, eval_offset:eval_offset + eval_samples]
+
+        # 경사 분리: EQ 모양은 tone loss가 정하고, 아래 손실은 drive_gain만 조정한다.
+        out_eval, gr_eval = limiter(eq_eval.detach(), input_gain_db=drive_gain, return_gr=True)
+        out_lufs = criterion.meter.integrated_lufs_channels(out_eval.unsqueeze(0))[0]
+        loss_loudness = (out_lufs - ref_target_lufs) ** 2
         max_gr_tensor = -torch.min(gr_eval["gr_tensor"])
         loss_gr = torch.relu(max_gr_tensor - max_gr_db) ** 2 * 25.0
-
-        loss = loss_vol + loss_gr
+        loss = loss_tone + loss_loudness + loss_gr
         loss.backward()
-        drive_opt.step()
 
-        # 믹스 자체 피크가 이미 실링을 넘는 경우 감쇠까지 내려가야 GR 상한을 지킬 수
-        # 있다. 다만 무한정 내려가지는 않게 하한을 둔다.
-        with torch.no_grad():
-            drive_gain.clamp_(min=_MIN_MAKEUP_DB, max=max(target_boost_db, 0.0))
+        if step < eq_iters:
+            eq_opt.step()
+        if step < _DRIVE_STEPS:
+            drive_opt.step()
+            with torch.no_grad():
+                drive_gain.clamp_(min=_MIN_MAKEUP_DB, max=drive_max_db)
 
-    # --- 하드 캡 가드 ---
-    # 위 최적화는 GR 예산을 '부드러운' 페널티로만 다룬다. 충분히 수렴하지 못했거나
-    # 볼륨 손실과 균형을 이룬 지점이 예산 위라면 GR 이 3.0 dB 를 넘긴 채로 끝난다.
-    # 그 상태의 마스터는 리미터 하나가 다이내믹을 전부 흡수한 뭉갠 소리가 되므로,
-    # _GR_HARD_CAP_DB 를 넘지 않을 때까지 결정론적으로 더 깎는다.
+    # 최종 EQ 파라미터로 선택 구간을 다시 렌더링한 뒤 잔여 과도 감쇄를 제한한다.
     with torch.no_grad():
+        curve_db, _ = eq.get_eq_curve_db()
+        tone_curve_db = curve_db * match_amount
+        gains_amp = torch.pow(10.0, tone_curve_db / 20.0)
+        delta_db = 10.0 * torch.log10(
+            ((gains_amp ** 2) * mix_power_flat).sum() / (mix_power_flat.sum() + eps) + eps
+        )
+        applied_curve_db_t = tone_curve_db - delta_db
+        gains_lin_t = torch.pow(10.0, applied_curve_db_t / 20.0)
+        filtered_context_stft = context_stft * gains_lin_t.view(1, -1, 1)
+        filtered_context = torch.istft(
+            filtered_context_stft, n_fft=n_fft, hop_length=hop, window=stft_window,
+            center=True, length=context.shape[-1],
+        )
+        eq_eval_final = filtered_context[:, eval_offset:eval_offset + eval_samples]
         for _ in range(_DRIVE_GUARD_STEPS):
-            _, gr_guard = limiter(eval_slice, input_gain_db=float(drive_gain.item()), return_gr=True)
+            _, gr_guard = limiter(eq_eval_final, input_gain_db=float(drive_gain.item()), return_gr=True)
             if (-gr_guard["max_db"]) <= _GR_HARD_CAP_DB or float(drive_gain.item()) <= _MIN_MAKEUP_DB:
                 break
             drive_gain.sub_(_DRIVE_GUARD_DB).clamp_(min=_MIN_MAKEUP_DB)
 
     with torch.no_grad():
+        applied_curve_db = applied_curve_db_t.numpy()
+        eq_level_shift_db = float(delta_db)
+        gains_lin = np.power(10.0, applied_curve_db / 20.0)
         final_drive_db = float(drive_gain.item())
-        # 곡 전체에 최적화된 마스터링 드라이브 적용
+
+    # 적용된 EQ 커브 샘플(UI 차트용).
+    freq_bins = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    sample_idx = np.unique(np.logspace(0, np.log10(len(freq_bins) - 1), 120).astype(int))
+    eq_curve_x = [float(freq_bins[i]) for i in sample_idx]
+    eq_curve_y = [float(applied_curve_db[i]) for i in sample_idx]
+
+    # 학습된 EQ와 드라이브/리미터를 전체 곡에 적용한다.
+    out = np.zeros_like(mix)
+    for ch in range(mix.shape[0]):
+        S = librosa.stft(mix[ch], n_fft=n_fft, hop_length=hop)
+        S = S * gains_lin[:, None]
+        out[ch] = librosa.istft(S, hop_length=hop, length=mix.shape[1])
+    pre_makeup_tensor = torch.from_numpy(out).float()
+    with torch.no_grad():
         out_tensor, gr = limiter(pre_makeup_tensor, input_gain_db=final_drive_db, return_gr=True)
         out = out_tensor.detach().cpu().numpy()
         makeup_db = final_drive_db
@@ -959,13 +978,13 @@ def master_track(mix_path, ref_path, out_path, sr=44100, num_bands=15,
         "eq_level_shift_db": round(eq_level_shift_db, 2),   # 중립화로 상쇄한 EQ 자체의 음량 변화
         "makeup_db": round(float(makeup_db), 2),
         "makeup_requested_db": round(float(makeup_requested), 2),
-        "makeup_held_back_db": round(float(makeup_requested - makeup_db), 2),
+        "makeup_held_back_db": round(float(max(0.0, makeup_requested - makeup_db)), 2),
         "limiter_gr_max_db": round(float(gr["max_db"]), 2),
         "limiter_gr_mean_db": round(float(gr["mean_db"]), 2),
         "limiter_active_pct": round(float(gr["active"]) * 100.0, 1),
         "max_gr_budget_db": max_gr_db,
         "window_sec": win_sec,
-        "window_track_s": [round(float(out_start) / sr, 1), round(float(out_end) / sr, 1)],
+        "window_track_s": [round(float(mix_start) / sr, 1), round(float(mix_end) / sr, 1)],
         "window_ref_s": [round(float(ref_start) / sr, 1), round(float(ref_end) / sr, 1)],
         "ref_lufs": round(float(ref_lufs), 2),
         "final_lufs": round(float(final_lufs), 2),

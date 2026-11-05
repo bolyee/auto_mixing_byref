@@ -361,12 +361,21 @@ processBtn.addEventListener('click', async () => {
             body: formData
         });
         
-        if (!response.ok) {
-            const errData = await response.json();
-            throw new Error(errData.detail || '이퀄라이징 처리에 실패했습니다.');
+        // 호스팅 서버는 오류 시 JSON 대신 빈 응답이나 HTML을 반환할 수 있다.
+        const responseText = await response.text();
+        let data = null;
+        try {
+            data = JSON.parse(responseText);
+        } catch {
+            // 아래에서 HTTP 상태와 함께 읽을 수 있는 오류를 표시한다.
         }
-        
-        const data = await response.json();
+        if (!response.ok) {
+            const detail = typeof data?.detail === 'string' ? data.detail : null;
+            throw new Error(detail || `음원 처리 요청 실패 (HTTP ${response.status}). Render의 Logs와 Events에서 같은 시간의 오류를 확인해 주세요.`);
+        }
+        if (!data?.audio_urls?.raw || !data?.audio_urls?.processed || !data?.audio_urls?.ref) {
+            throw new Error(`서버에서 정상적인 처리 결과를 받지 못했습니다 (HTTP ${response.status}, ${responseText.trim() ? '응답 형식 오류' : '빈 응답'}). Render 로그를 확인해 주세요.`);
+        }
         
         // Setup audio elements sources
         audioRaw.src = data.audio_urls.raw;

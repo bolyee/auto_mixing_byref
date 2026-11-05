@@ -137,6 +137,23 @@ class LoudnessMeter(nn.Module):
         z_gated = (z * g).sum(-1) / g.sum(-1).clamp_min(_EPS)
         return -0.691 + 10.0 * torch.log10(z_gated + _EPS)
 
+    def integrated_lufs_channels(self, x: torch.Tensor) -> torch.Tensor:
+        """미분 가능한 스테레오/멀티채널 통합 LUFS. 입력 [B, C, T], 출력 [B]."""
+        if x.ndim != 3:
+            raise ValueError("integrated_lufs_channels expects [B, C, T]")
+        batch, channels, samples = x.shape
+        y_k = self.k_weight(x.reshape(batch * channels, samples))
+        z = self._block_powers(y_k, self.block_len, self.block_hop)
+        z = z.reshape(batch, channels, -1).sum(dim=1)
+        l = -0.691 + 10.0 * torch.log10(z + _EPS)
+        g_abs = torch.sigmoid((l - (-70.0)) / 1.0)
+        z_avg = (z * g_abs).sum(-1) / g_abs.sum(-1).clamp_min(_EPS)
+        gamma = (-0.691 + 10.0 * torch.log10(z_avg + _EPS) - 10.0).detach()
+        g_rel = torch.sigmoid((l - gamma.unsqueeze(-1)) / 1.0)
+        g = g_abs * g_rel
+        z_gated = (z * g).sum(-1) / g.sum(-1).clamp_min(_EPS)
+        return -0.691 + 10.0 * torch.log10(z_gated + _EPS)
+
     def true_peak_db(self, x: torch.Tensor) -> torch.Tensor:
         """BS.1770-4 True Peak [B], dBTP. 4배 오버샘플 후 피크.
 
@@ -260,6 +277,7 @@ class DSPMatchingLoss(nn.Module):
         # mel 밴드 중심 주파수를 필터뱅크 무게중심으로 근사한다.
         freqs = torch.linspace(0.0, sample_rate / 2.0, n_freqs)
         centers = (fb * freqs.unsqueeze(1)).sum(0) / fb.sum(0).clamp_min(_EPS)  # [n_mels]
+        self.register_buffer("tone_frequencies", centers, persistent=False)
         self.register_buffer(
             "tone_mask",
             ((centers >= tone_fmin) & (centers < tone_fmax)).float(),
