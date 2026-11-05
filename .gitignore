@@ -44,3 +44,8 @@ ddsp_paper.pdf
 # --- Local tooling ---
 .claude/
 *.log
+# Local documents and diagrams
+*.pdf
+*.svg
+/presentation_*.md
+/PROJECT_BRIEF.md
