@@ -37,6 +37,10 @@ data/outputs/
 # --- Docs / papers ---
 ddsp_paper.pdf
 
+# --- Local presentation materials ---
+/presentation_*.md
+/presentation_*.pdf
+
 # --- Local tooling ---
 .claude/
 *.log
